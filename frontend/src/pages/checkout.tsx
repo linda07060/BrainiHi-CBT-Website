@@ -118,7 +118,7 @@ function cacheInvoiceLocally(serverPayment: any) {
 async function loadPayPalSdk(sdkSrc: string, timeoutMs = 15000): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     try {
-      const existing = Array.from(document.querySelectorAll('script[src^="https://www.paypal.com/sdk/js"]')) as HTMLScriptElement[];
+      const existing = Array.from(document.querySelectorAll('script[src^="https://www.paypal.com/sdk/js"], script[src^="https://www.sandbox.paypal.com/sdk/js"]')) as HTMLScriptElement[];
 
       for (const s of existing) {
         if (s.src && s.src !== sdkSrc) {
@@ -162,7 +162,7 @@ async function loadPayPalSdk(sdkSrc: string, timeoutMs = 15000): Promise<void> {
   });
 }
 
-/** Complete Checkout Page Logic */
+/** Complete Checkout Page Logic (card funding enabled) */
 export default function CheckoutPage(): JSX.Element {
   const router = useRouter();
   const { plan, billingPeriod, amount: amountQuery, invoiceId } = router.query as {
@@ -297,22 +297,31 @@ export default function CheckoutPage(): JSX.Element {
     }
   }
 
-  // Important: do NOT include pendingPaymentRef / pendingPaymentState in dependencies to avoid reinitializing payPal popup.
   useEffect(() => {
     if (!plan || !billingPeriod) {
       setError("Missing plan or billing period. Please select a plan from your account.");
       setLoading(false);
       return;
     }
+
     if (!clientId) {
       setError("PayPal client id missing. Set NEXT_PUBLIC_PAYPAL_CLIENT_ID in your frontend .env and restart the server.");
       setLoading(false);
       return;
     }
 
+    // IMPORTANT: to allow users to pay with debit/credit cards (guest checkout)
+    // - do NOT disable card funding. Use enable-funding=card,credit in SDK URL.
+    // - the merchant PayPal account must allow guest card checkout (PayPal account setting).
     const sdkSrc = `https://www.paypal.com/sdk/js?client-id=${encodeURIComponent(clientId)}&currency=${encodeURIComponent(
       computedPrice.currency ?? "USD"
-    )}&intent=capture&commit=true&disable-funding=card,credit`;
+    )}&intent=capture&commit=true&enable-funding=card,credit`;
+
+    // DEBUG: show which client id and sdk url are used in browser console
+    try {
+      // eslint-disable-next-line no-console
+      console.debug("[checkout] using PayPal clientId:", clientId, "sdkSrc:", sdkSrc);
+    } catch {}
 
     let mounted = true;
 
@@ -343,7 +352,11 @@ export default function CheckoutPage(): JSX.Element {
       containerRef.current.innerHTML = "";
 
       try {
+        // Allow rendering card/credit buttons explicitly as well (if supported for the merchant)
+        const allowedFunding = [window.paypal.FUNDING.CARD, window.paypal.FUNDING.CREDIT].filter(Boolean);
+
         window.paypal.Buttons({
+          funding: { allowed: allowedFunding },
           createOrder: async (data: any, actions: any) => {
             // Try client-side creation first
             if (actions && typeof actions.order?.create === "function") {
@@ -690,10 +703,6 @@ export default function CheckoutPage(): JSX.Element {
           <Box sx={{ mt: 3 }}>
             <Typography variant="caption" color="text.secondary">
               Need help? Contact{" "}
-              <MuiLink href="mailto:support@brainihi.com" underline="hover">
-                support@brainihi.com
-              </MuiLink>
-              . PayPal integration docs:{" "}
               <MuiLink
                 href="https://developer.paypal.com/docs/checkout/"
                 target="_blank"

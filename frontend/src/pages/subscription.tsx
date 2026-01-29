@@ -24,8 +24,6 @@ import {
   Select,
   FormControl,
   InputLabel,
-  useTheme,
-  useMediaQuery,
 } from "@mui/material";
 import axios from "axios";
 import Header from "../components/Header";
@@ -202,8 +200,41 @@ export default function SubscriptionPage(): JSX.Element {
   const apiBase = (process.env.NEXT_PUBLIC_API_URL || "").replace(/\/$/, "");
   const headers = token ? { Authorization: `Bearer ${token}` } : {};
 
-  const theme = useTheme();
-  const isXs = useMediaQuery(theme.breakpoints.down("sm")); // small and below
+  // Dev-only debug: log token presence + axios requests/responses for payments endpoints
+  useEffect(() => {
+    if (process.env.NODE_ENV === "production") return;
+    console.debug("[dev][subscription] token present:", !!token, token ? `len=${String(token).length}` : "none");
+    const reqId = axios.interceptors.request.use((config) => {
+      try {
+        if (config.url && String(config.url).includes("/api/payments")) {
+          console.debug("[dev][axios.request]", config.method, config.url, { headers: config.headers });
+        }
+      } catch {}
+      return config;
+    });
+    const resId = axios.interceptors.response.use(
+      (res) => {
+        try {
+          if (res.config?.url && String(res.config.url).includes("/api/payments")) {
+            console.debug("[dev][axios.response]", res.status, res.config.url);
+          }
+        } catch {}
+        return res;
+      },
+      (err) => {
+        try {
+          if (err?.config?.url && String(err.config.url).includes("/api/payments")) {
+            console.warn("[dev][axios.error]", err.response?.status ?? "no-status", err.config.url, err.message);
+          }
+        } catch {}
+        return Promise.reject(err);
+      }
+    );
+    return () => {
+      axios.interceptors.request.eject(reqId);
+      axios.interceptors.response.eject(resId);
+    };
+  }, [token]);
 
   const [sub, setSub] = useState<any | null>(null);
   const [profile, setProfile] = useState<any | null>(null);
@@ -230,6 +261,7 @@ export default function SubscriptionPage(): JSX.Element {
 
   const [snack, setSnack] = useState<{ severity: "success" | "info" | "warning" | "error"; message: string } | null>(null);
 
+  // change plan dialog
   const [changeOpen, setChangeOpen] = useState(false);
   const [changeSelectedPlan, setChangeSelectedPlan] = useState<string | null>(null);
   const [allowedChangeTargets, setAllowedChangeTargets] = useState<string[] | null>(null);
@@ -264,9 +296,9 @@ export default function SubscriptionPage(): JSX.Element {
         const url = (apiBase ? `${apiBase}` : "") + "/api/payments/subscription";
         let res: any | null = null;
         try {
-          res = await axios.get(url, { headers });
+          res = await axios.get(url, { headers, withCredentials: true });
         } catch {
-          res = await axios.get("/api/payments/subscription", { headers }).catch(() => null);
+          res = await axios.get("/api/payments/subscription", { headers, withCredentials: true }).catch(() => null);
         }
         if (!mountedLocal) return;
         setSub(res?.data ?? null);
@@ -287,9 +319,9 @@ export default function SubscriptionPage(): JSX.Element {
         const url = (apiBase ? `${apiBase}` : "") + "/auth/me";
         let res: any | null = null;
         try {
-          res = await axios.get(url, { headers });
+          res = await axios.get(url, { headers, withCredentials: true });
         } catch {
-          res = await axios.get("/auth/me", { headers }).catch(() => null);
+          res = await axios.get("/auth/me", { headers, withCredentials: true }).catch(() => null);
         }
         if (!mountedLocal) return;
         const fetchedUser = (res?.data ?? {}) as any;
@@ -321,18 +353,19 @@ export default function SubscriptionPage(): JSX.Element {
     return () => {
       mountedLocal = false;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token]);
 
   /* ---------- paymentStatus ---------- */
   const fetchPaymentStatus = async () => {
     if (!token) return null;
     try {
-      const url = (apiBase ? `${apiBase}` : "") + "/api/payments/check-access";
+      const url = `${process.env.NEXT_PUBLIC_API_URL}/api/payments/check-access`;
       let res: any | null = null;
       try {
-        res = await axios.get(url, { headers });
+        res = await axios.get(url, { headers, withCredentials: true });
       } catch {
-        res = await axios.get("/api/payments/check-access", { headers }).catch(() => null);
+        res = await axios.get("/api/payments/check-access", { headers, withCredentials: true }).catch(() => null);
       }
       const data = res?.data ?? null;
       setPaymentStatus(data);
@@ -347,6 +380,264 @@ export default function SubscriptionPage(): JSX.Element {
     fetchPaymentStatus().catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token]);
+
+  /* ---------- Invoices fetching (server returns user-scoped invoices) ---------- */
+  const fetchInvoices = async () => {
+    if (!token) return null;
+    try {
+      const url = (apiBase ? `${apiBase}` : "") + "/api/payments/invoices";
+      let res: any | null = null;
+      try {
+        res = await axios.get(url, { headers, withCredentials: true });
+      } catch {
+        res = await axios.get("/api/payments/invoices", { headers, withCredentials: true }).catch(() => null);
+      }
+      const raw = res?.data ?? null;
+      if (!raw) {
+        setInvoices([]);
+        saveInvoicesToCache([]);
+        return null;
+      }
+
+      // Normalize server response into Invoice[]
+      const mapped = (Array.isArray(raw) ? raw : [raw]).map((it: any) => ({
+        id: it.id ?? `inv-${Math.random().toString(36).slice(2, 9)}`,
+        plan: it.plan ?? "Free",
+        amount: String(it.amount ?? "0.00"),
+        currency: it.currency ?? "USD",
+        status: (it.status ?? "pending") as InvoiceStatus,
+        issuedAt: it.date ?? new Date().toISOString(),
+        reason: it.reason ?? null,
+        changeTo: it.change_to ?? null,
+      })) as Invoice[];
+
+      const sorted = mapped.sort((a, b) => Number(new Date(b.issuedAt)) - Number(new Date(a.issuedAt)));
+      setInvoices(sorted);
+      saveInvoicesToCache(sorted);
+      return sorted;
+    } catch {
+      return null;
+    }
+  };
+
+  useEffect(() => {
+    // clear invoices then fetch fresh whenever token changes
+    setInvoices([]);
+    fetchInvoices().catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token]);
+
+  /* ---------- Listen for checkout-created invoices (postMessage / custom event / SSE) ---------- */
+  useEffect(() => {
+    // Handler for custom event dispatched by checkout page
+    const onPaymentsCreatedEvent = (ev: Event) => {
+      try {
+        const detail = (ev as CustomEvent)?.detail ?? null;
+        const payment = detail?.payment ?? null;
+        if (payment) {
+          const invoice: Invoice = {
+            id: payment.id ?? `inv-${Math.random().toString(36).slice(2, 9)}`,
+            plan: payment.plan ?? "Free",
+            amount: String(payment.amount ?? "0.00"),
+            currency: payment.currency ?? "USD",
+            issuedAt: payment.date ?? new Date().toISOString(),
+            status: (payment.status ?? "pending") as InvoiceStatus,
+            reason: payment.reason ?? null,
+            changeTo: payment.change_to ?? null,
+          };
+
+          setInvoices((prev) => {
+            const map = new Map(prev.map((i) => [String(i.id), i]));
+            map.set(String(invoice.id), invoice);
+            const arr = Array.from(map.values()).sort((a, b) => Number(new Date(b.issuedAt)) - Number(new Date(a.issuedAt)));
+            saveInvoicesToCache(arr);
+            return arr;
+          });
+
+          // Also refresh authoritative list in background
+          fetchInvoices().catch(() => {});
+        }
+      } catch (err) {
+        // no-op
+      }
+    };
+
+    // Handler for postMessage from popup (window.opener)
+    const onWindowMessage = (ev: MessageEvent) => {
+      try {
+        if (!ev?.data) return;
+        if (ev.data?.type === "payment:created" && ev.data?.payment) {
+          const payment = ev.data.payment;
+          const invoice: Invoice = {
+            id: payment.id ?? `inv-${Math.random().toString(36).slice(2, 9)}`,
+            plan: payment.plan ?? "Free",
+            amount: String(payment.amount ?? "0.00"),
+            currency: payment.currency ?? "USD",
+            issuedAt: payment.date ?? new Date().toISOString(),
+            status: (payment.status ?? "pending") as InvoiceStatus,
+            reason: payment.reason ?? null,
+            changeTo: payment.change_to ?? null,
+          };
+          setInvoices((prev) => {
+            const map = new Map(prev.map((i) => [String(i.id), i]));
+            map.set(String(invoice.id), invoice);
+            const arr = Array.from(map.values()).sort((a, b) => Number(new Date(b.issuedAt)) - Number(new Date(a.issuedAt)));
+            saveInvoicesToCache(arr);
+            return arr;
+          });
+          fetchInvoices().catch(() => {});
+        }
+      } catch (err) {
+        // noop
+      }
+    };
+
+    window.addEventListener("payments:created", onPaymentsCreatedEvent as EventListener);
+    window.addEventListener("message", onWindowMessage);
+
+    // Also, on mount, check localStorage last_created_payment in case we missed the event
+    try {
+      const raw = localStorage.getItem("last_created_payment");
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed?.id) {
+          window.dispatchEvent(new CustomEvent("payments:created", { detail: { payment: parsed } }));
+          localStorage.removeItem("last_created_payment");
+        }
+      }
+    } catch {}
+
+    // SSE: connect to server-sent events endpoint for realtime updates.
+    // Preference: cookie-based auth (same-origin). If you only have JWT in JS, token will be appended in query string.
+    let es: EventSource | null = null;
+    try {
+      // Build SSE URL. If we have a JWT in JS (token), append it as `?token=` so the SSE controller can verify it
+      // (EventSource does not support fetch-like credentials in cross-origin scenarios).
+      const baseEvents = apiBase ? `${apiBase}/api/payments/events` : `/api/payments/events`;
+      const sseUrl = token ? `${baseEvents}${baseEvents.includes("?") ? "&" : "?"}token=${encodeURIComponent(token)}` : baseEvents;
+
+      // Create EventSource. If sseUrl is cross-origin and you rely on cookies, this won't send cookies; we append token when available.
+      es = new EventSource(sseUrl);
+
+      es.addEventListener("connected", () => {
+        // optional: console.debug("SSE connected");
+      });
+
+      es.addEventListener("paymentCreated", (ev: MessageEvent) => {
+        try {
+          const payload = JSON.parse((ev as any).data);
+          const payment = payload ?? null;
+          if (!payment) return;
+
+          const invoice: Invoice = {
+            id: payment.id ?? `inv-${Math.random().toString(36).slice(2, 9)}`,
+            plan: payment.plan ?? payment.plan_name ?? "Free",
+            amount: String(payment.amount ?? "0.00"),
+            currency: payment.currency ?? "USD",
+            issuedAt:
+              payment.date ??
+              payment.createdAt ??
+              new Date().toISOString(),
+            status: (payment.status ?? "pending") as InvoiceStatus,
+            reason: payment.reason ?? payment.__meta?.reason ?? null,
+            changeTo: payment.change_to ?? payment.__meta?.change_to ?? null,
+          };
+
+          setInvoices((prev) => {
+            const map = new Map(prev.map((i) => [String(i.id), i]));
+            map.set(String(invoice.id), invoice);
+            const arr = Array.from(map.values()).sort((a, b) => Number(new Date(b.issuedAt)) - Number(new Date(a.issuedAt)));
+            saveInvoicesToCache(arr);
+            return arr;
+          });
+
+          // Refresh authoritative list in background
+          fetchInvoices().catch(() => {});
+        } catch (err) {
+          // ignore malformed SSE payload
+        }
+      });
+
+      es.onerror = (err) => {
+        // EventSource has built-in reconnect; keep quiet in prod but optionally log for dev.
+        // console.warn("SSE error", err);
+      };
+    } catch (sseErr) {
+      // failed to initialize EventSource (browser incompat, blocked, etc.)
+      // console.warn("SSE init failed", sseErr);
+      es = null;
+    }
+
+    return () => {
+      window.removeEventListener("payments:created", onPaymentsCreatedEvent as EventListener);
+      window.removeEventListener("message", onWindowMessage);
+      try {
+        if (es) es.close();
+      } catch {}
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [apiBase, token]);
+
+  /* ---------- Poll while pending to pick up updates immediately after checkout/capture ---------- */
+  useEffect(() => {
+    let mountedLocal = true;
+    let timer: any = null;
+
+    const shouldPoll = () => {
+      if (!paymentStatus) return false;
+      const isPaid = Boolean(paymentStatus.activeSubscription || paymentStatus.hasSuccessfulPayment);
+      const pendingFlag = !isPaid && (paymentStatus?.plan && String(paymentStatus.plan).toLowerCase() !== "free");
+      const hasPendingInvoice = invoices.some((i) => i.status === "pending");
+      return Boolean(pendingFlag || hasPendingInvoice);
+    };
+
+    async function pollOnce() {
+      if (!mountedLocal) return;
+      const ps = await fetchPaymentStatus();
+      await fetchInvoices();
+      try {
+        const becameActive = ps && (ps.activeSubscription === true || ps.hasSuccessfulPayment === true);
+        if (becameActive && token) {
+          const url = (apiBase ? `${apiBase}` : "") + "/auth/me";
+          let res: any | null = null;
+          try {
+            res = await axios.get(url, { headers, withCredentials: true });
+          } catch {
+            res = await axios.get("/auth/me", { headers, withCredentials: true }).catch(() => null);
+          }
+          const fetchedUser = (res?.data ?? {}) as any;
+          const normalizedAuth = { token, user: fetchedUser };
+          try {
+            if (typeof window !== "undefined") localStorage.setItem("auth", JSON.stringify(normalizedAuth));
+          } catch {}
+          try {
+            setUser?.(normalizedAuth);
+            setProfile(fetchedUser);
+          } catch {}
+        }
+      } catch {}
+    }
+
+    if (shouldPoll()) timer = setInterval(() => pollOnce().catch(() => {}), 5000);
+
+    return () => {
+      mountedLocal = false;
+      if (timer) clearInterval(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [paymentStatus, invoices]);
+
+  /* ---------- Sort & filter invoices (render-ready) ---------- */
+  const sortInvoicesByIssuedDesc = (arr: Invoice[]) =>
+    [...arr].sort((a, b) => Number(new Date(b.issuedAt)) - Number(new Date(a.issuedAt)));
+
+  const sortedInvoices = useMemo(() => {
+    const unique = Array.from(new Map(invoices.map((i) => [i.id, i])).values());
+    return sortInvoicesByIssuedDesc(unique);
+  }, [invoices]);
+
+  const pendingInvoices = useMemo(() => sortedInvoices.filter((inv) => inv.status === "pending"), [sortedInvoices]);
+  const paidInvoices = useMemo(() => sortedInvoices.filter((i) => i.status === "paid"), [sortedInvoices]);
 
   /* ---------- Plan resolution ---------- */
   const storedAuth = (() => {
@@ -407,169 +698,7 @@ export default function SubscriptionPage(): JSX.Element {
     return null;
   }
 
-  /* ---------- utility: merge invoices and sort ---------- */
-  const sortInvoicesByIssuedDesc = (arr: Invoice[]) =>
-    [...arr].sort((a, b) => Number(new Date(b.issuedAt)) - Number(new Date(a.issuedAt)));
-
-  const mergeInvoices = (existing: Invoice[], incoming: Invoice[]) => {
-    const map = new Map<string, Invoice>();
-    for (const e of existing) map.set(e.id, e);
-    for (const i of incoming) map.set(i.id, i);
-    return sortInvoicesByIssuedDesc(Array.from(map.values()));
-  };
-
-  /* ---------- Invoices fetch & map (smart merge + cache) ---------- */
-  const fetchInvoices = async () => {
-    if (!token) return null;
-    try {
-      const url = (apiBase ? `${apiBase}` : "") + "/api/payments/invoices";
-      let res: any | null = null;
-      try {
-        res = await axios.get(url, { headers });
-      } catch {
-        res = await axios.get("/api/payments/invoices", { headers }).catch(() => null);
-      }
-      const raw = res?.data ?? null;
-
-      const mapServerInvoice = (it: any): Invoice => {
-        const status = String(it.status ?? "pending").toLowerCase();
-        const reasonRaw = it.reason ?? it.metadata?.reason ?? it.metadata?.reason_type ?? null;
-        let reason: InvoiceReason = "unknown";
-        if (reasonRaw) {
-          const r = String(reasonRaw).toLowerCase();
-          if (r.includes("change")) reason = "change_plan";
-          else if (r.includes("past")) reason = "past_due";
-          else if (r.includes("next")) reason = "next_due";
-          else reason = "regular";
-        } else {
-          if (it.metadata?.changePlan || (it.notes && /change/i.test(it.notes)) || it.change_to) reason = "change_plan";
-          else if (it.dueAt && new Date(it.dueAt).getTime() < Date.now()) reason = "past_due";
-          else reason = "regular";
-        }
-
-        const changeTo = it.change_to ?? it.metadata?.change_to ?? it.metadata?.changeTo ?? null;
-        const issuedRaw = it.createdAt ?? it.date ?? it.issued_at ?? Date.now();
-        const issuedAt = (() => {
-          try {
-            const d = new Date(issuedRaw);
-            if (!isNaN(d.getTime())) return d.toISOString();
-          } catch {}
-          return new Date().toISOString();
-        })();
-
-        return {
-          id: String(it.id ?? it.invoiceId ?? it._id ?? `inv-${Math.random().toString(36).slice(2, 9)}`),
-          plan: normalizePlanString(it.plan ?? it.planName ?? it.metadata?.plan ?? it.product?.name) ?? resolvedPlan,
-          changeTo: changeTo ? normalizePlanString(changeTo) : null,
-          amount: String(it.amount ?? it.total ?? it.price ?? "0.00"),
-          currency: String(it.currency ?? it.currency_code ?? it.currencyCode ?? "USD"),
-          issuedAt,
-          dueAt: it.dueAt ?? it.due_date ?? it.expires_at ?? null,
-          status: status === "paid" ? "paid" : status === "cancelled" ? "cancelled" : "pending",
-          notes: it.notes ?? null,
-          reason,
-        };
-      };
-
-      if (Array.isArray(raw) && raw.length > 1) {
-        const mapped: Invoice[] = raw.map(mapServerInvoice);
-        const unique = Array.from(new Map(mapped.map((i) => [i.id, i])).values());
-        const sorted = sortInvoicesByIssuedDesc(unique);
-        setInvoices(sorted);
-        saveInvoicesToCache(sorted);
-        return sorted;
-      }
-
-      if (Array.isArray(raw) && raw.length === 1) {
-        const mapped = mapServerInvoice(raw[0]);
-        setInvoices((prev) => {
-          const merged = mergeInvoices(prev, [mapped]);
-          saveInvoicesToCache(merged);
-          return merged;
-        });
-        return [mapped];
-      }
-
-      if (raw && typeof raw === "object" && !Array.isArray(raw)) {
-        const mapped = mapServerInvoice(raw);
-        setInvoices((prev) => {
-          const merged = mergeInvoices(prev, [mapped]);
-          saveInvoicesToCache(merged);
-          return merged;
-        });
-        return [mapped];
-      }
-
-      return null;
-    } catch {
-      return null;
-    }
-  };
-
-  useEffect(() => {
-    fetchInvoices().catch(() => {});
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token, resolvedPlan]);
-
-  /* ---------- Poll while pending to pick up updates immediately after checkout/capture ---------- */
-  useEffect(() => {
-    let mountedLocal = true;
-    let timer: any = null;
-
-    const shouldPoll = () => {
-      if (!paymentStatus) return false;
-      const isPaid = Boolean(paymentStatus.activeSubscription || paymentStatus.hasSuccessfulPayment);
-      const pendingFlag = !isPaid && (paymentStatus?.plan && String(paymentStatus.plan).toLowerCase() !== "free");
-      const hasPendingInvoice = invoices.some((i) => i.status === "pending");
-      return Boolean(pendingFlag || hasPendingInvoice);
-    };
-
-    async function pollOnce() {
-      if (!mountedLocal) return;
-      const ps = await fetchPaymentStatus();
-      await fetchInvoices();
-      try {
-        const becameActive = ps && (ps.activeSubscription === true || ps.hasSuccessfulPayment === true);
-        if (becameActive && token) {
-          const url = (apiBase ? `${apiBase}` : "") + "/auth/me";
-          let res: any | null = null;
-          try {
-            res = await axios.get(url, { headers });
-          } catch {
-            res = await axios.get("/auth/me", { headers }).catch(() => null);
-          }
-          const fetchedUser = (res?.data ?? {}) as any;
-          const normalizedAuth = { token, user: fetchedUser };
-          try {
-            if (typeof window !== "undefined") localStorage.setItem("auth", JSON.stringify(normalizedAuth));
-          } catch {}
-          try {
-            setUser?.(normalizedAuth);
-            setProfile(fetchedUser);
-          } catch {}
-        }
-      } catch {}
-    }
-
-    if (shouldPoll()) timer = setInterval(() => pollOnce().catch(() => {}), 5000);
-
-    return () => {
-      mountedLocal = false;
-      if (timer) clearInterval(timer);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [paymentStatus, invoices]);
-
-  /* ---------- Sort & filter invoices (render-ready) ---------- */
-  const sortedInvoices = useMemo(() => {
-    const unique = Array.from(new Map(invoices.map((i) => [i.id, i])).values());
-    return sortInvoicesByIssuedDesc(unique);
-  }, [invoices]);
-
-  const pendingInvoices = useMemo(() => sortedInvoices.filter((inv) => inv.status === "pending"), [sortedInvoices]);
-  const paidInvoices = useMemo(() => sortedInvoices.filter((i) => i.status === "paid"), [sortedInvoices]);
-
-  /* ---------- Billing status resolution ---------- */
+  /* ---------- Billing info (typed) ---------- */
   const billingInfo = useMemo(() => {
     let status: string = "unknown";
 
@@ -607,7 +736,7 @@ export default function SubscriptionPage(): JSX.Element {
     if (status === "unknown" || status === "pending") {
       if (pendingInvoices.length > 0) {
         const inv = pendingInvoices[0];
-        if (inv.reason === "change_plan") status = "past_due";
+        if ((inv as any).reason === "past_due") status = "past_due";
         else status = "pending";
       }
     }
@@ -624,7 +753,7 @@ export default function SubscriptionPage(): JSX.Element {
     const lastPaymentCandidate = sub?.last_payment_date ?? paidInvoices[0]?.issuedAt ?? null;
     const lastPayment = lastPaymentCandidate ? new Date(lastPaymentCandidate).toISOString() : null;
 
-    return { status, nextPayment, lastPayment };
+    return { status, nextPayment, lastPayment } as { status: string; nextPayment: string | null; lastPayment: string | null };
   }, [paymentStatus, sub, profile, pendingInvoices, paidInvoices]);
 
   function billingStatusColor(status: string) {
@@ -635,8 +764,6 @@ export default function SubscriptionPage(): JSX.Element {
     if (s === "pending") return "warning";
     return "default";
   }
-
-  const billingStatusDisplay = billingInfo.status ?? "unknown";
 
   /* ---------- Derived helpers ---------- */
   const billingFrequencyRaw = (sub?.billing_frequency ?? profile?.billing_frequency ?? "monthly").toString().toLowerCase();
@@ -682,9 +809,9 @@ export default function SubscriptionPage(): JSX.Element {
       const url = (apiBase ? `${apiBase}` : "") + "/api/payments/portal";
       let res: any | null = null;
       try {
-        res = await axios.post(url, {}, { headers });
+        res = await axios.post(url, {}, { headers, withCredentials: true });
       } catch {
-        res = await axios.post("/api/payments/portal", {}, { headers }).catch(() => null);
+        res = await axios.post("/api/payments/portal", {}, { headers, withCredentials: true }).catch(() => null);
       }
       const data: any = res?.data ?? null;
       const portalUrl = (data?.url) ?? (data?.portal_url) ?? (data?.redirectUrl) ?? (data?.checkoutUrl) ?? null;
@@ -818,7 +945,7 @@ export default function SubscriptionPage(): JSX.Element {
 
   /* ---------- Render helpers ---------- */
   const invoiceChip = (inv: Invoice) => {
-    const reason = inv.reason ?? "unknown";
+    const reason = (inv as any).reason ?? "unknown";
     if (inv.status === "paid") return <Chip label="Paid" size="small" color="success" />;
     if (reason === "past_due") return <Chip label="Past due" size="small" color="error" />;
     if (reason === "change_plan") return <Chip label={`Change → ${inv.changeTo ?? inv.plan}`} size="small" sx={{ bgcolor: "#f4e9f0", color: "#7b1d2d" }} />;
@@ -826,102 +953,151 @@ export default function SubscriptionPage(): JSX.Element {
     return <Chip label="Pending" size="small" color="warning" />;
   };
 
+  /* ---------- PLACEHOLDER while hydrating (client mount) ---------- */
+  if (!mounted) {
+    return (
+      <Container maxWidth="lg" sx={{ py: 6, display: "flex", alignItems: "center", justifyContent: "center", minHeight: "60vh" }}>
+        <CircularProgress />
+      </Container>
+    );
+  }
+
   /* ---------- Render ---------- */
   return (
-    <Container maxWidth="lg" sx={{ py: 3 }}>
+    <Container maxWidth="lg" sx={{ py: 6 }}>
       <Head>
         <title>Subscription — BrainiHi</title>
       </Head>
 
       <Header />
 
-      {/* Header + Actions: responsive layout */}
-      <Grid container spacing={2} alignItems="center" sx={{ mb: 2 }}>
-        <Grid item xs={12} sm={6}>
-          <Box>
-            <Typography variant={isXs ? "h5" : "h4"} sx={{ fontWeight: 800 }}>
-              Subscription
-            </Typography>
-            <Typography variant="subtitle1" color="text.secondary" sx={{ mt: 0.5 }}>
-              Account: {displayName}
-            </Typography>
-          </Box>
-        </Grid>
+      {/*
+        Layout note:
+        - On mobile we stack the heading and actions (buttons are centered and constrained to a comfortable max width).
+        - On desktop (md+) the actions are placed on the right and vertically centered.
+        - Buttons keep consistent spacing and do not overflow horizontally.
+      */}
+      <Box
+        sx={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: { xs: "flex-start", md: "space-between" },
+          mb: 3,
+          flexWrap: "wrap",
+          gap: 1,
+        }}
+      >
+        <Box sx={{ minWidth: 0, flex: { xs: "1 1 100%", md: "0 1 auto" } }}>
+          <Typography variant="h4" sx={{ fontWeight: 800, wordBreak: "break-word" }}>
+            Subscription
+          </Typography>
+          <Typography variant="subtitle1" color="text.secondary" sx={{ mt: 1 }}>
+            Account: {displayName}
+          </Typography>
+        </Box>
 
-        <Grid item xs={12} sm={6}>
-          <Stack
-            direction={isXs ? "column" : "row"}
-            spacing={1}
-            justifyContent={isXs ? "stretch" : "flex-end"}
-            alignItems="center"
-          >
+        {/* Buttons group */}
+        <Box
+          sx={{
+            display: "flex",
+            gap: 1,
+            alignItems: "center",
+            flexWrap: "wrap",
+            justifyContent: { xs: "center", md: "flex-end" },
+            mt: { xs: 2, md: 0 },
+            flex: { xs: "1 1 100%", md: "0 0 auto" },
+          }}
+        >
+          <Box sx={{ width: { xs: "90%", sm: "auto" }, maxWidth: { xs: 520, md: "none" } }}>
             <Button
               component={Link}
               href="/dashboard"
               variant="outlined"
+              fullWidth
               sx={{
                 textTransform: "none",
                 whiteSpace: "nowrap",
-                ...(isXs ? { width: "100%" } : {}),
+                fontWeight: 700,
+                borderRadius: 2,
+                py: 1.25,
               }}
             >
               Back to Dashboard
             </Button>
+          </Box>
 
+          <Box sx={{ width: { xs: "90%", sm: "auto" }, maxWidth: { xs: 520, md: "none" } }}>
             <Tooltip title={completeBtnTooltip}>
-              <span style={{ width: isXs ? "100%" : "auto" }}>
+              <Box>
                 <Button
                   variant="contained"
                   color="secondary"
                   onClick={() => openCompletePaymentDialog(resolvedPlan, billingPeriod)}
                   disabled={busy}
+                  fullWidth
                   sx={{
                     textTransform: "none",
-                    ...(isXs ? { width: "100%", py: 1.5 } : { px: 3 }),
+                    boxShadow: 2,
+                    fontWeight: 800,
+                    py: 1.25,
+                    borderRadius: 2,
                   }}
                 >
                   Complete payment
                 </Button>
-              </span>
+              </Box>
             </Tooltip>
+          </Box>
 
+          <Box sx={{ width: { xs: "90%", sm: "auto" }, maxWidth: { xs: 520, md: "none" } }}>
             <Button
               variant="outlined"
               color="inherit"
               onClick={handleLogout}
+              fullWidth
               sx={{
                 textTransform: "none",
                 whiteSpace: "nowrap",
-                ...(isXs ? { width: "100%" } : {}),
+                fontWeight: 700,
+                borderRadius: 2,
+                py: 1.25,
               }}
             >
               Logout
             </Button>
-          </Stack>
-        </Grid>
-      </Grid>
+          </Box>
+        </Box>
+      </Box>
 
       {hasPendingPayment && (
         <Box sx={{ mb: 2 }}>
           <Alert
             severity="warning"
             action={
-              <Button color="inherit" size="small" onClick={() => openCompletePaymentDialog(resolvedPlan, billingPeriod)}>
-                Complete payment
-              </Button>
+              <Button color="inherit" size="small" onClick={() => openCompletePaymentDialog(resolvedPlan, billingPeriod)}>Complete payment</Button>
             }
+            sx={{
+              display: "flex",
+              flexDirection: { xs: "column", sm: "row" },
+              alignItems: { xs: "flex-start", sm: "center" },
+              justifyContent: "space-between",
+              gap: 1,
+              wordBreak: "break-word",
+            }}
           >
-            You have a pending payment of <strong>{expectedPrice.amount} {expectedPrice.currency}</strong> for the <strong>{resolvedPlan}</strong> plan.
+            <Box sx={{ flex: 1 }}>
+              You have a pending payment of <strong>{expectedPrice.amount} {expectedPrice.currency}</strong> for the <strong>{resolvedPlan}</strong> plan.
+            </Box>
           </Alert>
         </Box>
       )}
 
       <Grid container spacing={3}>
         <Grid item xs={12} md={6}>
-          <Paper sx={{ p: 3 }}>
+          <Paper sx={{ p: { xs: 2, md: 3 } }}>
             <Typography variant="h6">Plan</Typography>
 
-            <Box sx={{ display: "flex", alignItems: "center", gap: 2, mt: 1 }}>
+            <Box sx={{ display: "flex", alignItems: "center", gap: 2, mt: 1, flexWrap: "wrap" }}>
               <Typography variant="h6" sx={{ fontWeight: 800 }}>
                 {resolvedPlan}
               </Typography>
@@ -933,7 +1109,7 @@ export default function SubscriptionPage(): JSX.Element {
               />
             </Box>
 
-            <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+            <Typography variant="body2" color="text.secondary" sx={{ mt: 1, wordBreak: "break-word" }}>
               {getBillingFrequencyDisplay() ?? "No billing frequency available"}
             </Typography>
 
@@ -953,39 +1129,16 @@ export default function SubscriptionPage(): JSX.Element {
 
             <Divider sx={{ my: 2 }} />
 
-            {/* Buttons: manage, reactivate, change plan - all aligned and consistent on mobile */}
-            <Stack direction={isXs ? "column" : "row"} spacing={1} alignItems="stretch">
-              <Button
-                variant="outlined"
-                onClick={openPortal}
-                disabled={busy}
-                fullWidth={isXs}
-                sx={{ textTransform: "none", py: isXs ? 1.25 : undefined }}
-              >
+            <Stack direction="row" spacing={1} sx={{ flexWrap: "wrap" }}>
+              <Button variant="outlined" onClick={openPortal} disabled={busy} sx={{ textTransform: "none", width: { xs: "100%", sm: "auto" } }}>
                 Manage billing
               </Button>
 
-              <Button
-                variant="contained"
-                onClick={() => doReactivate()}
-                disabled={busy || (billingInfo.status === "active")}
-                fullWidth={isXs}
-                sx={{ textTransform: "none", py: isXs ? 1.25 : undefined }}
-              >
+              <Button variant="contained" onClick={() => doReactivate()} disabled={busy || (billingInfo.status === "active")} sx={{ width: { xs: "100%", sm: "auto" } }}>
                 Reactivate
               </Button>
 
-              {/* Change plan made to match style and alignment with other buttons on mobile */}
-              <Button
-                variant="outlined"
-                color="inherit"
-                onClick={handleOpenChangePlan}
-                fullWidth={isXs}
-                sx={{
-                  textTransform: "none",
-                  py: isXs ? 1.25 : undefined,
-                }}
-              >
+              <Button variant="text" onClick={handleOpenChangePlan} sx={{ width: { xs: "100%", sm: "auto" } }}>
                 Change plan
               </Button>
             </Stack>
@@ -1008,7 +1161,13 @@ export default function SubscriptionPage(): JSX.Element {
         </Grid>
 
         <Grid item xs={12} md={6}>
-          <Paper sx={{ p: 3, height: { xs: "auto", md: "70vh" }, overflowY: "auto" }}>
+          <Paper
+            sx={{
+              p: { xs: 2, md: 3 },
+              height: { xs: "auto", md: "70vh" },
+              overflowY: { xs: "visible", md: "auto" },
+            }}
+          >
             <Typography variant="h6">Transaction history</Typography>
             <Box sx={{ mt: 1 }}>
               {pendingInvoices.length > 0 && (
@@ -1017,17 +1176,17 @@ export default function SubscriptionPage(): JSX.Element {
                   <Stack spacing={1} sx={{ mb: 2 }}>
                     {pendingInvoices.map((inv) => (
                       <Paper key={inv.id} sx={{ p: 2 }}>
-                        <Box sx={{ display: "flex", flexDirection: isXs ? "column" : "row", justifyContent: "space-between", alignItems: isXs ? "flex-start" : "center", gap: 1 }}>
-                          <Box>
-                            <Typography sx={{ fontWeight: 700 }}>{inv.plan}</Typography>
+                        <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 1, flexWrap: "wrap" }}>
+                          <Box sx={{ minWidth: 0 }}>
+                            <Typography sx={{ fontWeight: 700, wordBreak: "break-word" }}>{inv.plan}</Typography>
                             <Typography variant="caption" color="text.secondary">{new Date(inv.issuedAt).toLocaleString()}</Typography>
-                            {inv.reason === "change_plan" && (
+                            {(inv as any).reason === "change_plan" && (
                               <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
-                                Change of plan invoice {inv.changeTo ? `→ ${inv.changeTo}` : ""}
+                                Change of plan invoice {(inv as any).changeTo ? `→ ${(inv as any).changeTo}` : ""}
                               </Typography>
                             )}
                           </Box>
-                          <Box sx={{ display: "flex", gap: 1, alignItems: "center", mt: isXs ? 1 : 0 }}>
+                          <Box sx={{ display: "flex", gap: 1, alignItems: "center", ml: "auto" }}>
                             <Typography sx={{ fontWeight: 700 }}>{inv.amount} {inv.currency}</Typography>
                             {invoiceChip(inv)}
                             <Button size="small" onClick={() => openInvoiceDialog(inv)} sx={{ textTransform: "none" }}>View</Button>
@@ -1046,12 +1205,12 @@ export default function SubscriptionPage(): JSX.Element {
                 <Stack spacing={1}>
                   {paidInvoices.map((inv) => (
                     <Paper key={inv.id} sx={{ p: 2 }}>
-                      <Box sx={{ display: "flex", flexDirection: isXs ? "column" : "row", justifyContent: "space-between", alignItems: isXs ? "flex-start" : "center", gap: 1 }}>
-                        <Box>
-                          <Typography sx={{ fontWeight: 700 }}>{inv.plan}</Typography>
+                      <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 1, flexWrap: "wrap" }}>
+                        <Box sx={{ minWidth: 0 }}>
+                          <Typography sx={{ fontWeight: 700, wordBreak: "break-word" }}>{inv.plan}</Typography>
                           <Typography variant="caption" color="text.secondary">{new Date(inv.issuedAt).toLocaleString()}</Typography>
                         </Box>
-                        <Box sx={{ display: "flex", gap: 1, alignItems: "center", mt: isXs ? 1 : 0 }}>
+                        <Box sx={{ display: "flex", gap: 1, alignItems: "center", ml: "auto" }}>
                           <Typography sx={{ fontWeight: 700 }}>{inv.amount} {inv.currency}</Typography>
                           {invoiceChip(inv)}
                           <Button size="small" onClick={() => openInvoiceDialog(inv)} sx={{ textTransform: "none" }}>Receipt</Button>
@@ -1066,41 +1225,40 @@ export default function SubscriptionPage(): JSX.Element {
         </Grid>
       </Grid>
 
-      {/* Dialogs & Snackbars - unchanged logic */}
-      {mounted && (
-        <Dialog open={changeOpen} onClose={() => setChangeOpen(false)} maxWidth="sm" fullWidth>
-          <DialogTitle>Upgrade plan</DialogTitle>
-          <DialogContent dividers>
-            <Box sx={{ mt: 1 }}>
-              <FormControl fullWidth>
-                <InputLabel id="change-plan-label">Plan</InputLabel>
-                <Select
-                  labelId="change-plan-label"
-                  value={changeSelectedPlan ?? ""}
-                  label="Plan"
-                  onChange={(e) => setChangeSelectedPlan(String(e.target.value))}
-                >
-                  {(allowedChangeTargets ?? []).filter(p => normalizePlanString(p) !== normalizePlanString(resolvedPlan)).map((p) => (
-                    <MenuItem key={p} value={p}>{p}</MenuItem>
-                  ))}
-                </Select>
-              </FormControl>
-
-              <Box sx={{ mt: 2 }}>
-                <Typography variant="subtitle2">Plan limits ({changeSelectedPlan ?? "—"})</Typography>
-                {(changeSelectedPlan ? getPlanLimits(changeSelectedPlan) : getPlanLimits(resolvedPlan)).map((l, i) => (
-                  <Typography key={i} variant="body2">• {l}</Typography>
+      {/* Change plan dialog */}
+      <Dialog open={changeOpen} onClose={() => setChangeOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>Upgrade plan</DialogTitle>
+        <DialogContent dividers>
+          <Box sx={{ mt: 1 }}>
+            <FormControl fullWidth>
+              <InputLabel id="change-plan-label">Plan</InputLabel>
+              <Select
+                labelId="change-plan-label"
+                value={changeSelectedPlan ?? ""}
+                label="Plan"
+                onChange={(e) => setChangeSelectedPlan(String(e.target.value))}
+              >
+                {(allowedChangeTargets ?? []).filter(p => normalizePlanString(p) !== normalizePlanString(resolvedPlan)).map((p) => (
+                  <MenuItem key={p} value={p}>{p}</MenuItem>
                 ))}
-              </Box>
-            </Box>
-          </DialogContent>
-          <DialogActions>
-            <Button onClick={() => setChangeOpen(false)}>Cancel</Button>
-            <Button variant="contained" onClick={confirmChangePlan} disabled={!changeSelectedPlan}>Proceed to checkout</Button>
-          </DialogActions>
-        </Dialog>
-      )}
+              </Select>
+            </FormControl>
 
+            <Box sx={{ mt: 2 }}>
+              <Typography variant="subtitle2">Plan limits ({changeSelectedPlan ?? "—"})</Typography>
+              {(changeSelectedPlan ? getPlanLimits(changeSelectedPlan) : getPlanLimits(resolvedPlan)).map((l, i) => (
+                <Typography key={i} variant="body2">• {l}</Typography>
+              ))}
+            </Box>
+          </Box>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setChangeOpen(false)}>Cancel</Button>
+          <Button variant="contained" onClick={confirmChangePlan} disabled={!changeSelectedPlan}>Proceed to checkout</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Invoice dialog */}
       <Dialog open={invoiceDialogOpen} onClose={closeInvoiceDialog} maxWidth="sm" fullWidth>
         <DialogTitle>Invoice</DialogTitle>
         <DialogContent dividers>
@@ -1130,19 +1288,13 @@ export default function SubscriptionPage(): JSX.Element {
               <Typography variant="subtitle2">Plan expiry</Typography>
               <Typography variant="body2" sx={{ mb: 1 }}>{profile?.plan_expiry ? new Date(profile.plan_expiry).toLocaleString() : "N/A"}</Typography>
 
-              {selectedInvoice.reason === "change_plan" && (
+              {(selectedInvoice as any).reason === "change_plan" && (
                 <>
                   <Divider sx={{ my: 1 }} />
-                  <Typography variant="caption" color="text.secondary">This invoice is for a plan change{selectedInvoice.changeTo ? ` → ${selectedInvoice.changeTo}` : ""}.</Typography>
+                  <Typography variant="caption" color="text.secondary">This invoice is for a plan change{(selectedInvoice as any).changeTo ? ` → ${(selectedInvoice as any).changeTo}` : ""}.</Typography>
                 </>
               )}
 
-              {selectedInvoice.notes && (
-                <>
-                  <Divider sx={{ my: 1 }} />
-                  <Typography variant="caption" color="text.secondary">{selectedInvoice.notes}</Typography>
-                </>
-              )}
             </Box>
           ) : (
             <Box sx={{ py: 2 }}><CircularProgress size={20} /></Box>
@@ -1156,6 +1308,7 @@ export default function SubscriptionPage(): JSX.Element {
         </DialogActions>
       </Dialog>
 
+      {/* Reactivate confirmation dialog */}
       <Dialog open={reactivateDialogOpen} onClose={() => setReactivateDialogOpen(false)} maxWidth="sm" fullWidth>
         <DialogTitle>Confirm Reactivation</DialogTitle>
         <DialogContent dividers>
@@ -1182,6 +1335,7 @@ export default function SubscriptionPage(): JSX.Element {
         </DialogActions>
       </Dialog>
 
+      {/* Complete payment dialog */}
       <Dialog open={completePaymentDialogOpen} onClose={closeCompletePaymentDialog} maxWidth="xs" fullWidth>
         <DialogTitle>Complete payment</DialogTitle>
         <DialogContent>
@@ -1218,4 +1372,5 @@ export default function SubscriptionPage(): JSX.Element {
       </Snackbar>
     </Container>
   );
+
 }

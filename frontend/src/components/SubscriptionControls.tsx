@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from "react";
+import dynamic from "next/dynamic";
 import {
   Box,
   Button,
@@ -13,10 +14,12 @@ import {
 } from "@mui/material";
 import type { ChipProps } from "@mui/material";
 import axios from "axios";
-import PaymentMethodDisplay from "./PaymentMethodDisplay";
-import BillingHistory from "./BillingHistory";
 import UpgradePlanModal from "./UpgradePlanModal";
 import Link from "next/link";
+
+// Dynamically import client-only components to avoid SSR/hydration mismatches
+const PaymentMethodDisplay = dynamic(() => import("./PaymentMethodDisplay"), { ssr: false });
+const BillingHistory = dynamic(() => import("./BillingHistory"), { ssr: false });
 
 type Sub = {
   subscription_id?: string | null;
@@ -169,7 +172,7 @@ export default function SubscriptionControls({
           </Box>
         </Stack>
 
-        {/* Payment method preview */}
+        {/* Payment method preview (client-only via dynamic import) */}
         <PaymentMethodDisplay token={token} />
 
         {/* Quick links */}
@@ -221,7 +224,7 @@ export default function SubscriptionControls({
       </Dialog>
 
       <UpgradePlanModal open={upgradeOpen} onClose={() => setUpgradeOpen(false)} token={token} />
-      {/* Optional compact billing history preview */}
+      {/* Optional compact billing history preview (client-only via dynamic import) */}
       <BillingHistory token={token} compact />
     </Box>
   );
