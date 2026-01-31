@@ -521,7 +521,7 @@ export default function TransactionHistoryPage(): JSX.Element {
 
               <Box sx={{ mt: 2 }}>
                 <Typography variant="body2" sx={{ mb: 0.5 }}><strong>User:</strong> {userName ?? "—"}</Typography>
-                <Typography variant="body2"><strong>UID:</strong> {userUid ?? "—"}</Typography>
+                <Typography variant="body2"><strong>USER-ID:</strong> {userUid ?? "—"}</Typography>
               </Box>
             </Box>
 
