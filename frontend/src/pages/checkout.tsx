@@ -11,7 +11,7 @@ import {
   Stack,
   Link as MuiLink,
 } from "@mui/material";
-import Header from "../components/Header";
+// import Header from "../components/Header";
 import api from "../lib/api";
 
 /* ---- Response shapes ---- */
@@ -909,7 +909,7 @@ export default function CheckoutPage(): JSX.Element {
         <title>Checkout — BrainiHi</title>
       </Head>
 
-      <Header />
+      {/* <Header /> */}
 
       <Container maxWidth="sm" sx={{ py: 6 }}>
         <Box sx={{ p: 3, borderRadius: 2, boxShadow: 1, bgcolor: "background.paper" }}>
