@@ -255,6 +255,7 @@ export default function MyApp({ Component, pageProps }: AppProps) {
     "/test",
     "/review",
     "/admin/login",
+    "/checkout",
   ];
   const showFooter = !NO_FOOTER_PREFIXES.some((p) => router.pathname.startsWith(p));
 

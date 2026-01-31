@@ -9,9 +9,7 @@ import {
   Alert,
   Button,
   Stack,
-  Link as MuiLink,
 } from "@mui/material";
-import Header from "../components/Header";
 import api from "../lib/api";
 
 /* ---- Response shapes ---- */
@@ -80,35 +78,54 @@ function formatError(err: unknown): string {
 
 /* ---------- localStorage helpers for posting invoice to account page when opener missing ---------- */
 const INVOICES_CACHE_KEY = "cached_invoices_v1";
+const LAST_CREATED_KEY = "last_created_payment";
+
 function cacheInvoiceLocally(serverPayment: any) {
   try {
     const cachedRaw = localStorage.getItem(INVOICES_CACHE_KEY);
     const parsed = cachedRaw ? JSON.parse(cachedRaw) : [];
     const key = String(serverPayment.id ?? `inv-${Math.random().toString(36).slice(2, 9)}`);
+    const issuedAtIso =
+      serverPayment.date
+        ? new Date(serverPayment.date).toISOString()
+        : serverPayment.createdAt
+        ? new Date(serverPayment.createdAt).toISOString()
+        : serverPayment.created_at
+        ? new Date(serverPayment.created_at).toISOString()
+        : new Date().toISOString();
+
     const norm = {
       id: key,
       plan: serverPayment.plan ?? serverPayment.plan_name ?? "Unknown",
       amount: String(serverPayment.amount ?? serverPayment.total ?? "0.00"),
       currency: serverPayment.currency ?? "USD",
-      issuedAt: serverPayment.date
-        ? new Date(serverPayment.date).toISOString()
-        : serverPayment.createdAt
-        ? new Date(serverPayment.createdAt).toISOString()
-        : new Date().toISOString(),
+      issuedAt: issuedAtIso,
+      createdAt: issuedAtIso,
+      created_at: issuedAtIso,
       status: String(serverPayment.status ?? "pending").toLowerCase(),
       receipt_url: serverPayment.receipt_url ?? `/receipt/${key}`,
       reason: serverPayment.reason ?? serverPayment.__meta?.reason ?? null,
       change_to: serverPayment.change_to ?? serverPayment.__meta?.change_to ?? null,
+      raw: serverPayment,
     };
+
     const merged = [norm, ...(Array.isArray(parsed) ? parsed : [])].filter(Boolean);
+
+    // Deduplicate by createdAt / issuedAt / date (created_at)
     const seen = new Set<string>();
     const dedup = merged.filter((m: any) => {
-      const k = String(m.id);
-      if (seen.has(k)) return false;
-      seen.add(k);
+      const createdAtKey = String(m.createdAt ?? m.issuedAt ?? m.date ?? m.created_at ?? m.id ?? "");
+      if (!createdAtKey) return true;
+      if (seen.has(createdAtKey)) return false;
+      seen.add(createdAtKey);
       return true;
     });
     localStorage.setItem(INVOICES_CACHE_KEY, JSON.stringify(dedup));
+
+    // Also set last_created_payment so other tabs that only check that key are notified
+    try {
+      localStorage.setItem(LAST_CREATED_KEY, JSON.stringify(serverPayment));
+    } catch {}
   } catch (e) {
     // noop
   }
@@ -162,14 +179,50 @@ async function loadPayPalSdk(sdkSrc: string, timeoutMs = 15000): Promise<void> {
   });
 }
 
+/** Poll invoices by id (used to wait for authoritative invoice to appear) */
+async function pollInvoicesForId(id: string | number, opts?: any, attempts = 15, delayMs = 2000) {
+  if (!id) return null;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const res = await api.get("/api/payments/invoices", opts);
+      const list = res?.data ?? [];
+      if (Array.isArray(list)) {
+        try { localStorage.setItem(INVOICES_CACHE_KEY, JSON.stringify(list)); } catch {}
+        const found = list.find((it: any) => String(it?.id) === String(id));
+        if (found) {
+          try { window.dispatchEvent(new CustomEvent("payments:created", { detail: { payment: found } })); } catch {}
+          try { if (window.opener) window.opener.postMessage({ type: "payment:created", payment: found }, window.location.origin ?? "*"); } catch {}
+          try { localStorage.setItem(LAST_CREATED_KEY, JSON.stringify(found)); } catch {}
+          return found;
+        }
+      }
+    } catch (e) {
+      // ignore fetch errors and retry
+    }
+    await new Promise((r) => setTimeout(r, delayMs));
+  }
+  return null;
+}
+
+/** Retry capture helper - single implementation (fixes duplicate function error) */
+async function retryCapture(orderID: string, opts?: any) {
+  try {
+    const res = await api.post("/api/payments/capture", { orderID }, opts);
+    return res?.data ?? null;
+  } catch {
+    return null;
+  }
+}
+
 /** Complete Checkout Page Logic (card funding enabled) */
 export default function CheckoutPage(): JSX.Element {
   const router = useRouter();
-  const { plan, billingPeriod, amount: amountQuery, invoiceId } = router.query as {
+  const { plan, billingPeriod, amount: amountQuery, invoiceId, reason: reasonQuery } = router.query as {
     plan?: string;
     billingPeriod?: string;
     amount?: string;
     invoiceId?: string;
+    reason?: string;
   };
 
   const apiBase = (process.env.NEXT_PUBLIC_API_URL || "").replace(/\/$/, "");
@@ -181,6 +234,10 @@ export default function CheckoutPage(): JSX.Element {
   const [orderID, setOrderID] = useState<string | null>(null);
   const [processing, setProcessing] = useState(false);
   const [creating, setCreating] = useState(false);
+
+  // Prevent duplicate create-pending calls
+  const [pendingRequestInProgress, setPendingRequestInProgress] = useState(false);
+  const didInitRef = useRef(false);
 
   // Use ref for pendingPayment so we don't reinitialize SDK when it changes
   const pendingPaymentRef = useRef<any | null>(null);
@@ -198,56 +255,234 @@ export default function CheckoutPage(): JSX.Element {
     return mapPlanPrice(plan ?? undefined, billingPeriod ?? undefined);
   })();
 
-  // Hide footer on this page
-  useEffect(() => {
-    if (typeof document === "undefined") return;
-    const footer = document.querySelector("footer");
-    if (!footer) return;
-    const prevDisplay = (footer as HTMLElement).style.display;
-    try {
-      (footer as HTMLElement).style.display = "none";
-    } catch {}
-    return () => {
-      try {
-        (footer as HTMLElement).style.display = prevDisplay || "";
-      } catch {}
-    };
-  }, []);
+  // Persist client_temp_id per checkout parameters so retries / concurrent requests reuse same token
+  function clientTempKeyFor(plan?: string, billing?: string, amount?: string) {
+    const p = String(plan ?? "Pro");
+    const b = String(billing ?? "monthly");
+    const a = String(amount ?? "");
+    return `checkout_client_temp:${p}:${b}:${a}`;
+  }
 
-  // Create pending invoice on server ASAP (store in ref to avoid re-triggering SDK)
-  async function createPendingPaymentOnServer(): Promise<CreatePendingResponse> {
+  function makeTempId() {
+    return `temp-${Math.random().toString(36).slice(2, 9)}-${Date.now().toString(36)}`;
+  }
+
+  function getOrCreateClientTempId() {
     try {
-      const url = "/api/payments/create-pending";
-      const payload: any = { plan: plan ?? "Pro", billingPeriod: billingPeriod ?? "monthly", amount: computedPrice.amount };
-      const token = getLocalAuthTokenFromStorage();
-      const opts = token ? { headers: { Authorization: `Bearer ${token}` } } : undefined;
-      const res = await api.post<CreatePendingResponse>(url, payload, opts);
-      const data = res?.data ?? null;
-      if (data) {
-        // set ref first
-        pendingPaymentRef.current = data?.payment ?? data;
-        setPendingPaymentState(data?.payment ?? data);
-        try {
-          if (window.opener) {
-            window.opener.postMessage({ type: "payment:created", payment: data?.payment ?? data }, window.location.origin ?? "*");
-          } else {
-            cacheInvoiceLocally(data?.payment ?? data);
-          }
-        } catch {
-          cacheInvoiceLocally(data?.payment ?? data);
-        }
-      }
-      return data;
-    } catch (err) {
-      console.warn("createPendingPaymentOnServer failed", formatError(err));
-      return null;
+      const k = clientTempKeyFor(plan, billingPeriod, computedPrice.amount);
+      const existing = localStorage.getItem(k);
+      if (existing) return existing;
+      const id = makeTempId();
+      localStorage.setItem(k, id);
+      return id;
+    } catch {
+      return makeTempId();
     }
   }
 
+  function clearClientTempId() {
+    try {
+      const k = clientTempKeyFor(plan, billingPeriod, computedPrice.amount);
+      localStorage.removeItem(k);
+    } catch {}
+  }
+
+  // Create pending invoice on server ASAP (store in ref to avoid re-triggering SDK)
+  async function createPendingPaymentOnServer(): Promise<CreatePendingResponse> {
+    // Prevent duplicate concurrent calls
+    if (pendingRequestInProgress) {
+      console.warn("createPendingPaymentOnServer: pending request already in progress — skipping duplicate call");
+      return null;
+    }
+    setPendingRequestInProgress(true);
+
+    const syntheticId = getOrCreateClientTempId();
+    const nowIso = new Date().toISOString();
+
+    const syntheticInvoice = {
+      id: syntheticId,
+      plan: plan ?? "Pro",
+      amount: String(computedPrice.amount ?? "0.00"),
+      currency: computedPrice.currency ?? "USD",
+      date: nowIso,
+      issuedAt: nowIso,
+      createdAt: nowIso,
+      created_at: nowIso,
+      status: "pending_local",
+      receipt_url: null,
+      reason: reasonQuery ? String(reasonQuery) : "pending_local",
+      change_to: null,
+      __synthetic: true,
+      raw: { __synthetic: true, client_temp_id: syntheticId, __meta: { reason: reasonQuery ?? "regular", createdAt: nowIso, created_at: nowIso } },
+    };
+
+    try {
+      // Put a synthetic pending invoice into local cache immediately
+      try {
+        const raw = localStorage.getItem(INVOICES_CACHE_KEY);
+        const parsed = raw ? JSON.parse(raw) : [];
+        const merged = [syntheticInvoice, ...(Array.isArray(parsed) ? parsed : [])];
+        const seen = new Set<string>();
+        const dedup = merged.filter((m: any) => {
+          const key = String(m.createdAt ?? m.issuedAt ?? m.created_at ?? m.id ?? "");
+          if (!key) return true;
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
+        localStorage.setItem(INVOICES_CACHE_KEY, JSON.stringify(dedup));
+        localStorage.setItem(LAST_CREATED_KEY, JSON.stringify(syntheticInvoice));
+        window.dispatchEvent(new CustomEvent("payments:created", { detail: { payment: syntheticInvoice } }));
+        if (window.opener) window.opener.postMessage({ type: "payment:created", payment: syntheticInvoice }, window.location.origin ?? "*");
+      } catch {}
+
+      // Before calling server, try to fetch existing invoices and reuse an existing pending if present
+      try {
+        const token = getLocalAuthTokenFromStorage();
+        const opts = token ? { headers: { Authorization: `Bearer ${token}` } } : undefined;
+        const resExisting = await api.get("/api/payments/invoices", opts);
+        const existingList = resExisting?.data ?? [];
+        if (Array.isArray(existingList)) {
+          // Prefer by client_temp_id match
+          const byToken = existingList.find((it: any) => {
+            try {
+              const raw = it?.raw ?? {};
+              const meta = typeof raw === "string" ? JSON.parse(raw).__meta : raw.__meta;
+              return meta?.client_temp_id && String(meta.client_temp_id) === syntheticId && String((it?.status ?? "").toLowerCase()).startsWith("pending");
+            } catch {
+              return false;
+            }
+          });
+          if (byToken) {
+            pendingPaymentRef.current = byToken;
+            setPendingPaymentState(byToken);
+            try { localStorage.setItem(LAST_CREATED_KEY, JSON.stringify(byToken)); } catch {}
+            return { payment: byToken, paymentId: byToken.id ?? null };
+          }
+
+          // Otherwise check for pending in same minute
+          const minuteKey = new Date(nowIso);
+          minuteKey.setSeconds(0,0);
+          const minuteIso = minuteKey.toISOString();
+          const byMinute = existingList.find((it: any) => {
+            const dateStr = it?.date ?? it?.createdAt ?? it?.created_at ?? null;
+            if (!dateStr) return false;
+            try {
+              const d = new Date(dateStr);
+              const m = new Date(d);
+              m.setSeconds(0,0);
+              return m.toISOString() === minuteIso && String((it?.status ?? "").toLowerCase()).startsWith("pending");
+            } catch {
+              return false;
+            }
+          });
+          if (byMinute) {
+            pendingPaymentRef.current = byMinute;
+            setPendingPaymentState(byMinute);
+            try { localStorage.setItem(LAST_CREATED_KEY, JSON.stringify(byMinute)); } catch {}
+            return { payment: byMinute, paymentId: byMinute.id ?? null };
+          }
+        }
+      } catch (e) {
+        // ignore fetch errors and continue to create pending
+      }
+
+      // Call server create-pending (authenticated preferred)
+      const url = "/api/payments/create-pending";
+      const payload: any = { plan: plan ?? "Pro", billingPeriod: billingPeriod ?? "monthly", amount: computedPrice.amount, client_temp_id: syntheticId, createdAt: nowIso, created_at: nowIso };
+      if (reasonQuery) payload.reason = String(reasonQuery);
+
+      const token = getLocalAuthTokenFromStorage();
+      const opts = token ? { headers: { Authorization: `Bearer ${token}` } } : undefined;
+
+      let res;
+      try {
+        res = await api.post<CreatePendingResponse>(url, payload, opts);
+      } catch (err: any) {
+        const status = err?.response?.status ?? null;
+        const serverMsg = err?.response?.data ?? err?.message ?? formatError(err);
+        console.warn("[checkout.createPending] create-pending failed", status, serverMsg);
+
+        try {
+          if (status === 401 || status === 403) {
+            alert("Not authenticated: create-pending failed (401/403). Please log in and try again.");
+          } else {
+            alert("Failed to create pending invoice on server. See console for details.");
+          }
+        } catch {}
+        return null;
+      }
+
+      const data = res?.data ?? null;
+
+      if (data && (data.payment ?? data)) {
+        const serverPayment = (data.payment ?? data) as any;
+        try {
+          // normalize and replace synthetic entry
+          const rawCache = localStorage.getItem(INVOICES_CACHE_KEY);
+          const parsedCache = rawCache ? JSON.parse(rawCache) : [];
+          const key = String(serverPayment.id ?? `inv-${Math.random().toString(36).slice(2, 9)}`);
+          const createdAtIso =
+            serverPayment.date
+              ? new Date(serverPayment.date).toISOString()
+              : serverPayment.createdAt
+              ? new Date(serverPayment.createdAt).toISOString()
+              : serverPayment.created_at
+              ? new Date(serverPayment.created_at).toISOString()
+              : new Date().toISOString();
+          const norm = {
+            id: key,
+            plan: serverPayment.plan ?? serverPayment.plan_name ?? plan ?? "Unknown",
+            amount: String(serverPayment.amount ?? serverPayment.total ?? computedPrice.amount ?? "0.00"),
+            currency: serverPayment.currency ?? computedPrice.currency ?? "USD",
+            issuedAt: createdAtIso,
+            createdAt: createdAtIso,
+            created_at: createdAtIso,
+            status: String(serverPayment.status ?? "pending").toLowerCase(),
+            receipt_url: serverPayment.receipt_url ?? `/receipt/${key}`,
+            reason: serverPayment.reason ?? serverPayment.__meta?.reason ?? null,
+            change_to: serverPayment.change_to ?? serverPayment.__meta?.change_to ?? null,
+            raw: serverPayment,
+          };
+          const filtered = (Array.isArray(parsedCache) ? parsedCache.filter((p: any) => String(p.id) !== syntheticId && (String(p.createdAt ?? p.created_at ?? "") !== norm.createdAt)) : parsedCache);
+          const newCache = [norm, ...filtered];
+          const seen2 = new Set<string>();
+          const dedup2 = newCache.filter((m: any) => {
+            const k = String(m.createdAt ?? m.issuedAt ?? m.created_at ?? m.id ?? "");
+            if (!k) return true;
+            if (seen2.has(k)) return false;
+            seen2.add(k);
+            return true;
+          });
+          localStorage.setItem(INVOICES_CACHE_KEY, JSON.stringify(dedup2));
+        } catch {}
+        try { localStorage.setItem(LAST_CREATED_KEY, JSON.stringify(serverPayment)); } catch {}
+        try { window.dispatchEvent(new CustomEvent("payments:created", { detail: { payment: serverPayment } })); } catch {}
+        try { if (window.opener) window.opener.postMessage({ type: "payment:created", payment: serverPayment }, window.location.origin ?? "*"); } catch {}
+        // Clear the persisted token for this checkout so future checkouts get a fresh token
+        clearClientTempId();
+        pendingPaymentRef.current = serverPayment;
+        setPendingPaymentState(serverPayment);
+      }
+
+      return data;
+    } finally {
+      setPendingRequestInProgress(false);
+    }
+  }
+
+  // Only run initialization once when plan and billingPeriod are available.
   useEffect(() => {
+    if (!plan || !billingPeriod) {
+      // Wait until plan/billing are set
+      return;
+    }
+    if (didInitRef.current) return;
+    didInitRef.current = true;
     createPendingPaymentOnServer().catch(() => {});
+    // Intentionally dependent on plan & billingPeriod — but guarded by didInitRef to run once
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [plan, billingPeriod]);
 
   // Helper to call backend create-order endpoint (used as fallback)
   async function serverCreateOrder(): Promise<CreateOrderResponse> {
@@ -255,48 +490,33 @@ export default function CheckoutPage(): JSX.Element {
     const payload: any = { plan: plan ?? "Pro", billingPeriod: billingPeriod ?? "monthly" };
     if (amountQuery) payload.amount = computedPrice.amount;
     if (invoiceId) payload.invoiceId = invoiceId;
+    if (reasonQuery) payload.reason = String(reasonQuery);
     const token = getLocalAuthTokenFromStorage();
     const opts = token ? { headers: { Authorization: `Bearer ${token}` } } : undefined;
     const res = await api.post<CreateOrderResponse>(url, payload, opts);
     return res.data;
   }
 
-  // Polling helper: poll /api/payments/invoices until the invoice id appears (or timeout)
-  async function pollInvoicesForId(id: string | number, opts?: any, attempts = 15, delayMs = 2000) {
-    if (!id) return null;
-    for (let i = 0; i < attempts; i++) {
-      try {
-        const res = await api.get("/api/payments/invoices", opts);
-        const list = res?.data ?? [];
-        if (Array.isArray(list)) {
-          try { localStorage.setItem(INVOICES_CACHE_KEY, JSON.stringify(list)); } catch {}
-          const found = list.find((it: any) => String(it?.id) === String(id));
-          if (found) {
-            // notify listeners with authoritative invoice
-            try { window.dispatchEvent(new CustomEvent("payments:created", { detail: { payment: found } })); } catch {}
-            try { if (window.opener) window.opener.postMessage({ type: "payment:created", payment: found }, window.location.origin ?? "*"); } catch {}
-            return found;
-          }
-        }
-      } catch (e) {
-        // ignore fetch errors and retry
-      }
-      await new Promise((r) => setTimeout(r, delayMs));
-    }
-    return null;
-  }
-
-  // Helper to retry capture (replay) to force server to update/associate row
-  async function retryCapture(orderID: string, opts?: any) {
+  // Public attach fallback that includes client_temp_id so server can upsert
+  async function publicAttachFallback(orderID: string) {
     try {
-      const res = await api.post("/api/payments/capture", { orderID }, opts);
+      const key = clientTempKeyFor(plan, billingPeriod, computedPrice.amount);
+      const clientTemp = localStorage.getItem(key) ?? undefined;
+      const createdAt = pendingPaymentRef.current?.createdAt ?? pendingPaymentState?.createdAt ?? new Date().toISOString();
+      const res = await api.post<AttachOrderResponse>("/api/payments/attach-order-public", {
+        orderID,
+        raw: { __meta: { reason: reasonQuery ?? null, client_temp_id: clientTemp ?? null } },
+        createdAt,
+        created_at: createdAt,
+        client_temp_id: clientTemp ?? undefined,
+      });
       return res?.data ?? null;
     } catch (e) {
-      // swallow
       return null;
     }
   }
 
+  // PayPal Buttons and main UI flow (keeps logic concise but complete)
   useEffect(() => {
     if (!plan || !billingPeriod) {
       setError("Missing plan or billing period. Please select a plan from your account.");
@@ -310,23 +530,16 @@ export default function CheckoutPage(): JSX.Element {
       return;
     }
 
-    // IMPORTANT: to allow users to pay with debit/credit cards (guest checkout)
-    // - do NOT disable card funding. Use enable-funding=card,credit in SDK URL.
-    // - the merchant PayPal account must allow guest card checkout (PayPal account setting).
     const sdkSrc = `https://www.paypal.com/sdk/js?client-id=${encodeURIComponent(clientId)}&currency=${encodeURIComponent(
       computedPrice.currency ?? "USD"
     )}&intent=capture&commit=true&enable-funding=card,credit`;
-
-    // DEBUG: show which client id and sdk url are used in browser console
-    try {
-      // eslint-disable-next-line no-console
-      console.debug("[checkout] using PayPal clientId:", clientId, "sdkSrc:", sdkSrc);
-    } catch {}
 
     let mounted = true;
 
     async function renderButtons(): Promise<void> {
       if (!mounted) return;
+
+      // If we already have a pendingPayment (from initialization or earlier), don't trigger create-pending again here.
       try {
         await loadPayPalSdk(sdkSrc, 15000);
       } catch (err) {
@@ -358,7 +571,12 @@ export default function CheckoutPage(): JSX.Element {
         window.paypal.Buttons({
           funding: { allowed: allowedFunding },
           createOrder: async (data: any, actions: any) => {
-            // Try client-side creation first
+            // If we already have a pending payment with an id, prefer that (prevents duplicate server calls)
+            if (pendingPaymentRef.current?.id) {
+              return String(pendingPaymentRef.current.id);
+            }
+
+            // Try client-side creation first (PayPal actions)
             if (actions && typeof actions.order?.create === "function") {
               try {
                 setCreating(true);
@@ -383,9 +601,11 @@ export default function CheckoutPage(): JSX.Element {
                     const token = getLocalAuthTokenFromStorage();
                     const opts = token ? { headers: { Authorization: `Bearer ${token}` } } : undefined;
                     const attachUrl = "/api/payments/attach-order";
+                    // include raw metadata with reason if present
+                    const rawMeta = { __meta: { reason: reasonQuery ?? null } };
                     const attachRes = await api.post<AttachOrderResponse>(
                       attachUrl,
-                      { paymentId: pendingPaymentRef.current.id, orderID: clientOrderId },
+                      { paymentId: pendingPaymentRef.current.id, orderID: clientOrderId, raw: rawMeta },
                       opts,
                     );
 
@@ -398,6 +618,7 @@ export default function CheckoutPage(): JSX.Element {
                       // Save to localStorage for subscription page fallback and dispatch event
                       try {
                         localStorage.setItem("last_created_payment", JSON.stringify(serverPayment));
+                        localStorage.setItem(LAST_CREATED_KEY, JSON.stringify(serverPayment));
                       } catch {}
                       try {
                         window.dispatchEvent(new CustomEvent("payments:created", { detail: { payment: serverPayment } }));
@@ -413,24 +634,15 @@ export default function CheckoutPage(): JSX.Element {
                     // If authenticated attach fails (401/403/other), attempt public attach fallback
                     console.warn("attach-order failed (auth), attempting public attach:", formatError(attachErr));
                     try {
-                      const publicUrl = "/api/payments/attach-order-public";
-                      const pubRes = await api.post<AttachOrderResponse>(publicUrl, { orderID: clientOrderId });
-                      const pubPayment = pubRes?.data?.payment ?? null;
+                      const pubRes = await publicAttachFallback(clientOrderId);
+                      const pubPayment = pubRes?.payment ?? pubRes ?? null;
                       if (pubPayment) {
                         pendingPaymentRef.current = pubPayment;
                         setPendingPaymentState(pubPayment);
-                        try {
-                          localStorage.setItem("last_created_payment", JSON.stringify(pubPayment));
-                        } catch {}
-                        try {
-                          window.dispatchEvent(new CustomEvent("payments:created", { detail: { payment: pubPayment } }));
-                        } catch {}
-                        try {
-                          if (window.opener) window.opener.postMessage({ type: "payment:created", payment: pubPayment }, window.location.origin ?? "*");
-                          else cacheInvoiceLocally(pubPayment);
-                        } catch {
-                          cacheInvoiceLocally(pubPayment);
-                        }
+                        try { localStorage.setItem("last_created_payment", JSON.stringify(pubPayment)); } catch {}
+                        try { window.dispatchEvent(new CustomEvent("payments:created", { detail: { payment: pubPayment } })); } catch {}
+                        try { if (window.opener) window.opener.postMessage({ type: "payment:created", payment: pubPayment }, window.location.origin ?? "*"); else cacheInvoiceLocally(pubPayment); } catch { cacheInvoiceLocally(pubPayment); }
+                        clearClientTempId();
                       }
                     } catch (pubErr) {
                       console.warn("public attach failed", formatError(pubErr));
@@ -457,6 +669,7 @@ export default function CheckoutPage(): JSX.Element {
               if (serverPayment) {
                 try {
                   localStorage.setItem("last_created_payment", JSON.stringify(serverPayment));
+                  localStorage.setItem(LAST_CREATED_KEY, JSON.stringify(serverPayment));
                 } catch {}
                 try {
                   window.dispatchEvent(new CustomEvent("payments:created", { detail: { payment: serverPayment } }));
@@ -497,9 +710,21 @@ export default function CheckoutPage(): JSX.Element {
               // If server returned a normalized invoice shape, persist & notify other pages immediately.
               try {
                 if (saved && Object.keys(saved).length > 0) {
+                  // Ensure createdAt fields exist for dedupe
+                  const savedCreatedAt =
+                    (saved.date && new Date(saved.date).toISOString()) ??
+                    (saved.createdAt && new Date(saved.createdAt).toISOString()) ??
+                    (saved.created_at && new Date(saved.created_at).toISOString()) ??
+                    null;
+                  if (savedCreatedAt) {
+                    try { saved.createdAt = savedCreatedAt; } catch {}
+                    try { saved.created_at = savedCreatedAt; } catch {}
+                  }
+
                   // Persist fallback keys used by subscription page
                   try {
                     localStorage.setItem("last_created_payment", JSON.stringify(saved));
+                    localStorage.setItem(LAST_CREATED_KEY, JSON.stringify(saved));
                   } catch {}
                   try {
                     // Also merge into cached invoices list used by subscription page
@@ -510,22 +735,28 @@ export default function CheckoutPage(): JSX.Element {
                       plan: saved.plan ?? "Unknown",
                       amount: String(saved.amount ?? "0.00"),
                       currency: saved.currency ?? "USD",
-                      issuedAt: saved.date ?? new Date().toISOString(),
+                      issuedAt: saved.date ?? saved.createdAt ?? new Date().toISOString(),
+                      createdAt: saved.createdAt ?? saved.created_at ?? saved.date ?? new Date().toISOString(),
+                      created_at: saved.created_at ?? saved.createdAt ?? saved.date ?? new Date().toISOString(),
                       status: String(saved.status ?? "pending").toLowerCase(),
                       receipt_url: saved.receipt_url ?? `/receipt/${saved.id ?? ""}`,
-                      reason: saved.reason ?? null,
-                      change_to: saved.change_to ?? null,
+                      reason: saved.reason ?? saved.__meta?.reason ?? null,
+                      change_to: saved.change_to ?? saved.__meta?.change_to ?? null,
+                      raw: saved,
                     };
                     const merged = [normalizedForCache, ...(Array.isArray(existing) ? existing : [])];
-                    // dedupe by id
+                    // dedupe by createdAt/issuedAt/date (primary)
                     const seen = new Set<string>();
                     const dedup = merged.filter((m: any) => {
-                      const k = String(m.id);
-                      if (seen.has(k)) return false;
-                      seen.add(k);
+                      const createdAtKey = String(m.createdAt ?? m.issuedAt ?? m.date ?? m.created_at ?? m.id ?? "");
+                      if (!createdAtKey) return true;
+                      if (seen.has(createdAtKey)) return false;
+                      seen.add(createdAtKey);
                       return true;
                     });
                     localStorage.setItem(INVOICES_CACHE_KEY, JSON.stringify(dedup));
+                    // ensure last_created_payment also present for storage listeners
+                    try { localStorage.setItem(LAST_CREATED_KEY, JSON.stringify(saved)); } catch {}
                   } catch {}
 
                   // Dispatch events for opener/subscription page
@@ -594,9 +825,9 @@ export default function CheckoutPage(): JSX.Element {
     return () => {
       mounted = false;
     };
-    // intentionally NOT including pendingPaymentRef/pendingPaymentState to avoid reinitialising the SDK mid-flow
+    // intentionally include plan/billingPeriod so SDK init ties to selected plan — createPending is guarded by didInitRef
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [apiBase, clientId, plan, billingPeriod, invoiceId, computedPrice.currency]);
+  }, [apiBase, clientId, plan, billingPeriod, invoiceId, computedPrice.currency, reasonQuery]);
 
   // Redirect handlers and utilities
   function handleReturnToAccount() {
@@ -619,8 +850,6 @@ export default function CheckoutPage(): JSX.Element {
       <Head>
         <title>Checkout — BrainiHi</title>
       </Head>
-
-      <Header />
 
       <Container maxWidth="sm" sx={{ py: 6 }}>
         <Box sx={{ p: 3, borderRadius: 2, boxShadow: 1, bgcolor: "background.paper" }}>
@@ -699,20 +928,6 @@ export default function CheckoutPage(): JSX.Element {
               </Box>
             </>
           )}
-
-          <Box sx={{ mt: 3 }}>
-            <Typography variant="caption" color="text.secondary">
-              Need help? Contact{" "}
-              <MuiLink
-                href="https://developer.paypal.com/docs/checkout/"
-                target="_blank"
-                rel="noopener"
-              >
-                developer.paypal.com/docs/checkout
-              </MuiLink>
-              .
-            </Typography>
-          </Box>
         </Box>
       </Container>
     </>

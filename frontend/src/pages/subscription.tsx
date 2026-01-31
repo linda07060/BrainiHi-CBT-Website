@@ -24,6 +24,8 @@ import {
   Select,
   FormControl,
   InputLabel,
+  ToggleButton,
+  ToggleButtonGroup,
 } from "@mui/material";
 import axios from "axios";
 import Header from "../components/Header";
@@ -157,7 +159,7 @@ function parseJwtPayload(tokenStr?: string | null): any | null {
 }
 
 /* ---------- Invoice type ---------- */
-type InvoiceStatus = "pending" | "paid" | "cancelled";
+type InvoiceStatus = "pending" | "paid" | "cancelled" | "completed" | "succeeded" | "success";
 type InvoiceReason = "change_plan" | "past_due" | "next_due" | "regular" | "unknown";
 type Invoice = {
   id: string;
@@ -174,6 +176,7 @@ type Invoice = {
 
 /* ---------- localStorage helpers for invoice caching ---------- */
 const INVOICES_CACHE_KEY = "cached_invoices_v1";
+const LAST_CREATED_KEY = "last_created_payment";
 function loadInvoicesFromCache(): Invoice[] {
   if (typeof window === "undefined") return [];
   try {
@@ -199,6 +202,9 @@ export default function SubscriptionPage(): JSX.Element {
 
   const apiBase = (process.env.NEXT_PUBLIC_API_URL || "").replace(/\/$/, "");
   const headers = token ? { Authorization: `Bearer ${token}` } : {};
+
+  // small tooltip text reused
+  const txTooltip = "View your billing history — pending and paid invoices";
 
   // Dev-only debug: log token presence + axios requests/responses for payments endpoints
   useEffect(() => {
@@ -264,6 +270,7 @@ export default function SubscriptionPage(): JSX.Element {
   // change plan dialog
   const [changeOpen, setChangeOpen] = useState(false);
   const [changeSelectedPlan, setChangeSelectedPlan] = useState<string | null>(null);
+  const [changeBillingPeriod, setChangeBillingPeriod] = useState<"monthly" | "yearly">("monthly");
   const [allowedChangeTargets, setAllowedChangeTargets] = useState<string[] | null>(null);
 
   const [reactivateDialogOpen, setReactivateDialogOpen] = useState(false);
@@ -385,17 +392,43 @@ export default function SubscriptionPage(): JSX.Element {
   const fetchInvoices = async () => {
     if (!token) return null;
     try {
-      const url = (apiBase ? `${apiBase}` : "") + "/api/payments/invoices";
+      const urlBase = (apiBase ? `${apiBase}` : "") + "/api/payments/invoices";
+      // cache-busting param
+      const url = `${urlBase}${urlBase.includes("?") ? "&" : "?"}_=${Date.now()}`;
+
+      // request with no-cache headers to avoid 304 caching interfering with data delivery
+      const opts = { headers: { ...(headers as any), "Cache-Control": "no-cache", Pragma: "no-cache" }, withCredentials: true };
+
       let res: any | null = null;
       try {
-        res = await axios.get(url, { headers, withCredentials: true });
-      } catch {
-        res = await axios.get("/api/payments/invoices", { headers, withCredentials: true }).catch(() => null);
+        res = await axios.get(url, opts);
+      } catch (err) {
+        // fallback to relative path (in case apiBase is not configured or cross-origin issues)
+        try {
+          res = await axios.get(`/api/payments/invoices?_=${Date.now()}`, opts).catch(() => null);
+        } catch {
+          res = null;
+        }
       }
+
+      // If 304 Not Modified (some intermediaries), fallback to cached local data
+      if (res && res.status === 304) {
+        const cached = loadInvoicesFromCache();
+        if (cached && cached.length > 0) {
+          setInvoices((prev) => {
+            const arr = [...cached, ...prev]; // prepend authoritative server list
+            saveInvoicesToCache(arr);
+            return arr;
+          });
+          return cached;
+        }
+        return null;
+      }
+
       const raw = res?.data ?? null;
+
+      // If server returned null / empty, do not clear current invoices (to avoid wiping UI)
       if (!raw) {
-        setInvoices([]);
-        saveInvoicesToCache([]);
         return null;
       }
 
@@ -407,29 +440,55 @@ export default function SubscriptionPage(): JSX.Element {
         currency: it.currency ?? "USD",
         status: (it.status ?? "pending") as InvoiceStatus,
         issuedAt: it.date ?? new Date().toISOString(),
-        reason: it.reason ?? null,
+        reason: it.reason ?? (it.__meta?.reason ?? null),
         changeTo: it.change_to ?? null,
       })) as Invoice[];
 
       const sorted = mapped.sort((a, b) => Number(new Date(b.issuedAt)) - Number(new Date(a.issuedAt)));
-      setInvoices(sorted);
-      saveInvoicesToCache(sorted);
+
+      // Prepend authoritative server list so UI shows all rows (no merge)
+      setInvoices((prev) => {
+        const out = [...sorted, ...prev];
+        saveInvoicesToCache(out);
+        return out;
+      });
+
       return sorted;
-    } catch {
+    } catch (err) {
+      // On error, keep existing invoices (avoid wiping UI), log for debugging
+      try {
+        // eslint-disable-next-line no-console
+        console.warn("[subscription] fetchInvoices failed:", err);
+      } catch {}
       return null;
     }
   };
 
   useEffect(() => {
-    // clear invoices then fetch fresh whenever token changes
-    setInvoices([]);
+    // clear UI only when token changes (we still prefer not to blank on transient errors)
+    setInvoices(loadInvoicesFromCache());
+    // run first fetch immediately and schedule short retries to cover timing windows
     fetchInvoices().catch(() => {});
+    const t1 = setTimeout(() => fetchInvoices().catch(() => {}), 500);
+    const t2 = setTimeout(() => fetchInvoices().catch(() => {}), 1500);
+    const t3 = setTimeout(() => fetchInvoices().catch(() => {}), 3000);
+    return () => {
+      clearTimeout(t1);
+      clearTimeout(t2);
+      clearTimeout(t3);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token]);
 
   /* ---------- Listen for checkout-created invoices (postMessage / custom event / SSE) ---------- */
   useEffect(() => {
-    // Handler for custom event dispatched by checkout page
+    const scheduleRefreshes = () => {
+      fetchInvoices().catch(() => {});
+      setTimeout(() => fetchInvoices().catch(() => {}), 500);
+      setTimeout(() => fetchInvoices().catch(() => {}), 1500);
+      setTimeout(() => fetchInvoices().catch(() => {}), 3000);
+    };
+
     const onPaymentsCreatedEvent = (ev: Event) => {
       try {
         const detail = (ev as CustomEvent)?.detail ?? null;
@@ -442,27 +501,23 @@ export default function SubscriptionPage(): JSX.Element {
             currency: payment.currency ?? "USD",
             issuedAt: payment.date ?? new Date().toISOString(),
             status: (payment.status ?? "pending") as InvoiceStatus,
-            reason: payment.reason ?? null,
-            changeTo: payment.change_to ?? null,
+            reason: payment.reason ?? payment.__meta?.reason ?? null,
+            changeTo: payment.change_to ?? payment.__meta?.change_to ?? null,
           };
 
           setInvoices((prev) => {
-            const map = new Map(prev.map((i) => [String(i.id), i]));
-            map.set(String(invoice.id), invoice);
-            const arr = Array.from(map.values()).sort((a, b) => Number(new Date(b.issuedAt)) - Number(new Date(a.issuedAt)));
+            const arr = [invoice, ...prev]; // prepend (no merging)
             saveInvoicesToCache(arr);
             return arr;
           });
 
-          // Also refresh authoritative list in background
-          fetchInvoices().catch(() => {});
+          scheduleRefreshes();
         }
       } catch (err) {
         // no-op
       }
     };
 
-    // Handler for postMessage from popup (window.opener)
     const onWindowMessage = (ev: MessageEvent) => {
       try {
         if (!ev?.data) return;
@@ -475,102 +530,113 @@ export default function SubscriptionPage(): JSX.Element {
             currency: payment.currency ?? "USD",
             issuedAt: payment.date ?? new Date().toISOString(),
             status: (payment.status ?? "pending") as InvoiceStatus,
-            reason: payment.reason ?? null,
-            changeTo: payment.change_to ?? null,
+            reason: payment.reason ?? payment.__meta?.reason ?? null,
+            changeTo: payment.change_to ?? payment.__meta?.change_to ?? null,
           };
           setInvoices((prev) => {
-            const map = new Map(prev.map((i) => [String(i.id), i]));
-            map.set(String(invoice.id), invoice);
-            const arr = Array.from(map.values()).sort((a, b) => Number(new Date(b.issuedAt)) - Number(new Date(a.issuedAt)));
+            const arr = [invoice, ...prev]; // prepend (no merging)
             saveInvoicesToCache(arr);
             return arr;
           });
-          fetchInvoices().catch(() => {});
+          scheduleRefreshes();
         }
       } catch (err) {
         // noop
       }
     };
 
-    window.addEventListener("payments:created", onPaymentsCreatedEvent as EventListener);
-    window.addEventListener("message", onWindowMessage);
+    const onStorage = (ev: StorageEvent) => {
+      try {
+        if (!ev.key) return;
+        if (ev.key === LAST_CREATED_KEY && ev.newValue) {
+          let parsed = null;
+          try { parsed = JSON.parse(ev.newValue); } catch {}
+          if (parsed) {
+            try { window.dispatchEvent(new CustomEvent("payments:created", { detail: { payment: parsed } })); } catch {}
+          }
+          scheduleRefreshes();
+        } else if (ev.key === INVOICES_CACHE_KEY && ev.newValue) {
+          try {
+            const parsedList = JSON.parse(ev.newValue);
+            if (Array.isArray(parsedList)) {
+              const mapped = parsedList.map((payment: any) => ({
+                id: payment.id ?? `inv-${Math.random().toString(36).slice(2, 9)}`,
+                plan: payment.plan ?? "Free",
+                amount: String(payment.amount ?? "0.00"),
+                currency: payment.currency ?? "USD",
+                status: (payment.status ?? "pending") as InvoiceStatus,
+                issuedAt: payment.issuedAt ?? payment.date ?? new Date().toISOString(),
+                reason: payment.reason ?? payment.__meta?.reason ?? null,
+                changeTo: payment.change_to ?? payment.__meta?.change_to ?? null,
+              })) as Invoice[];
+              setInvoices((prev) => {
+                const arr = [...mapped, ...prev]; // prepend authoritative cache contents
+                saveInvoicesToCache(arr);
+                return arr;
+              });
+            }
+          } catch (e) {}
+        }
+      } catch {}
+    };
 
-    // Also, on mount, check localStorage last_created_payment in case we missed the event
     try {
-      const raw = localStorage.getItem("last_created_payment");
+      const raw = localStorage.getItem(LAST_CREATED_KEY);
       if (raw) {
         const parsed = JSON.parse(raw);
         if (parsed?.id) {
           window.dispatchEvent(new CustomEvent("payments:created", { detail: { payment: parsed } }));
-          localStorage.removeItem("last_created_payment");
+          try { localStorage.removeItem(LAST_CREATED_KEY); } catch {}
         }
       }
     } catch {}
 
-    // SSE: connect to server-sent events endpoint for realtime updates.
-    // Preference: cookie-based auth (same-origin). If you only have JWT in JS, token will be appended in query string.
     let es: EventSource | null = null;
     try {
-      // Build SSE URL. If we have a JWT in JS (token), append it as `?token=` so the SSE controller can verify it
-      // (EventSource does not support fetch-like credentials in cross-origin scenarios).
       const baseEvents = apiBase ? `${apiBase}/api/payments/events` : `/api/payments/events`;
       const sseUrl = token ? `${baseEvents}${baseEvents.includes("?") ? "&" : "?"}token=${encodeURIComponent(token)}` : baseEvents;
-
-      // Create EventSource. If sseUrl is cross-origin and you rely on cookies, this won't send cookies; we append token when available.
       es = new EventSource(sseUrl);
-
-      es.addEventListener("connected", () => {
-        // optional: console.debug("SSE connected");
-      });
 
       es.addEventListener("paymentCreated", (ev: MessageEvent) => {
         try {
           const payload = JSON.parse((ev as any).data);
           const payment = payload ?? null;
           if (!payment) return;
-
           const invoice: Invoice = {
             id: payment.id ?? `inv-${Math.random().toString(36).slice(2, 9)}`,
             plan: payment.plan ?? payment.plan_name ?? "Free",
             amount: String(payment.amount ?? "0.00"),
             currency: payment.currency ?? "USD",
             issuedAt:
-              payment.date ??
-              payment.createdAt ??
-              new Date().toISOString(),
+              payment.date ?? payment.createdAt ?? new Date().toISOString(),
             status: (payment.status ?? "pending") as InvoiceStatus,
             reason: payment.reason ?? payment.__meta?.reason ?? null,
             changeTo: payment.change_to ?? payment.__meta?.change_to ?? null,
           };
 
           setInvoices((prev) => {
-            const map = new Map(prev.map((i) => [String(i.id), i]));
-            map.set(String(invoice.id), invoice);
-            const arr = Array.from(map.values()).sort((a, b) => Number(new Date(b.issuedAt)) - Number(new Date(a.issuedAt)));
+            const arr = [invoice, ...prev]; // prepend (no merging)
             saveInvoicesToCache(arr);
             return arr;
           });
 
-          // Refresh authoritative list in background
-          fetchInvoices().catch(() => {});
+          scheduleRefreshes();
         } catch (err) {
-          // ignore malformed SSE payload
+          // ignore
         }
       });
 
-      es.onerror = (err) => {
-        // EventSource has built-in reconnect; keep quiet in prod but optionally log for dev.
-        // console.warn("SSE error", err);
-      };
-    } catch (sseErr) {
-      // failed to initialize EventSource (browser incompat, blocked, etc.)
-      // console.warn("SSE init failed", sseErr);
-      es = null;
-    }
+      es.onerror = () => {};
+    } catch { /* ignore SSE init errors */ }
+
+    window.addEventListener("payments:created", onPaymentsCreatedEvent as EventListener);
+    window.addEventListener("message", onWindowMessage);
+    window.addEventListener("storage", onStorage);
 
     return () => {
       window.removeEventListener("payments:created", onPaymentsCreatedEvent as EventListener);
       window.removeEventListener("message", onWindowMessage);
+      window.removeEventListener("storage", onStorage);
       try {
         if (es) es.close();
       } catch {}
@@ -587,7 +653,7 @@ export default function SubscriptionPage(): JSX.Element {
       if (!paymentStatus) return false;
       const isPaid = Boolean(paymentStatus.activeSubscription || paymentStatus.hasSuccessfulPayment);
       const pendingFlag = !isPaid && (paymentStatus?.plan && String(paymentStatus.plan).toLowerCase() !== "free");
-      const hasPendingInvoice = invoices.some((i) => i.status === "pending");
+      const hasPendingInvoice = invoices.some((i) => String(i.status).toLowerCase() === "pending");
       return Boolean(pendingFlag || hasPendingInvoice);
     };
 
@@ -632,12 +698,12 @@ export default function SubscriptionPage(): JSX.Element {
     [...arr].sort((a, b) => Number(new Date(b.issuedAt)) - Number(new Date(a.issuedAt)));
 
   const sortedInvoices = useMemo(() => {
-    const unique = Array.from(new Map(invoices.map((i) => [i.id, i])).values());
-    return sortInvoicesByIssuedDesc(unique);
+    // We intentionally keep duplicates; preserve every DB row received.
+    return sortInvoicesByIssuedDesc(invoices);
   }, [invoices]);
 
-  const pendingInvoices = useMemo(() => sortedInvoices.filter((inv) => inv.status === "pending"), [sortedInvoices]);
-  const paidInvoices = useMemo(() => sortedInvoices.filter((i) => i.status === "paid"), [sortedInvoices]);
+  const pendingInvoices = useMemo(() => sortedInvoices.filter((inv) => String(inv.status).toLowerCase() === "pending"), [sortedInvoices]);
+  const paidInvoices = useMemo(() => sortedInvoices.filter((i) => ["paid","completed","succeeded","success"].includes(String(i.status).toLowerCase())), [sortedInvoices]);
 
   /* ---------- Plan resolution ---------- */
   const storedAuth = (() => {
@@ -847,7 +913,15 @@ export default function SubscriptionPage(): JSX.Element {
     setReactivateDialogOpen(false);
     setBusy(true);
     try {
-      await router.push({ pathname: "/checkout", query: { plan: reactivatePayload.plan, billingPeriod, amount: reactivatePayload.amount.split(" ")[0] } });
+      await router.push({
+        pathname: "/checkout",
+        query: {
+          plan: reactivatePayload.plan,
+          billingPeriod,
+          amount: reactivatePayload.amount.split(" ")[0],
+          reason: "past_due", // explicit reason for reactivate flow
+        },
+      });
     } catch (err) {
       console.warn("navigate to checkout failed", err);
       setSnack({ severity: "error", message: "Unable to navigate to checkout. Please try again." });
@@ -867,6 +941,8 @@ export default function SubscriptionPage(): JSX.Element {
     else allowed = ["Pro", "Tutor"];
     setAllowedChangeTargets(allowed);
     setChangeSelectedPlan(allowed.length > 0 ? allowed[0] : null);
+    // default billing toggle to current billing period (if available) or monthly
+    setChangeBillingPeriod(billingPeriod === "yearly" ? "yearly" : "monthly");
     setChangeOpen(true);
   };
 
@@ -875,7 +951,11 @@ export default function SubscriptionPage(): JSX.Element {
     setChangeOpen(false);
     setBusy(true);
     try {
-      await router.push({ pathname: "/checkout", query: { plan: changeSelectedPlan, billingPeriod, amount: mapPlanPrice(changeSelectedPlan, billingPeriod).amount } });
+      const amount = mapPlanPrice(changeSelectedPlan, changeBillingPeriod).amount;
+      await router.push({
+        pathname: "/checkout",
+        query: { plan: changeSelectedPlan, billingPeriod: changeBillingPeriod, amount, reason: "change_plan" },
+      });
     } catch (err) {
       console.warn("navigate to checkout failed", err);
       setSnack({ severity: "error", message: "Unable to navigate to checkout. Please try again." });
@@ -946,12 +1026,17 @@ export default function SubscriptionPage(): JSX.Element {
   /* ---------- Render helpers ---------- */
   const invoiceChip = (inv: Invoice) => {
     const reason = (inv as any).reason ?? "unknown";
-    if (inv.status === "paid") return <Chip label="Paid" size="small" color="success" />;
+    if (["paid", "completed", "succeeded", "success"].includes(String(inv.status).toLowerCase())) return <Chip label="Paid" size="small" color="success" />;
     if (reason === "past_due") return <Chip label="Past due" size="small" color="error" />;
     if (reason === "change_plan") return <Chip label={`Change → ${inv.changeTo ?? inv.plan}`} size="small" sx={{ bgcolor: "#f4e9f0", color: "#7b1d2d" }} />;
     if (reason === "next_due") return <Chip label="Next due" size="small" color="info" />;
     return <Chip label="Pending" size="small" color="warning" />;
   };
+
+  /* ---------- Debug: log invoices changes (helps confirm UI receives server data) ---------- */
+  useEffect(() => {
+    console.debug("[subscription] invoices state updated:", invoices.map(i => i.id));
+  }, [invoices]);
 
   /* ---------- PLACEHOLDER while hydrating (client mount) ---------- */
   if (!mounted) {
@@ -971,12 +1056,6 @@ export default function SubscriptionPage(): JSX.Element {
 
       <Header />
 
-      {/*
-        Layout note:
-        - On mobile we stack the heading and actions (buttons are centered and constrained to a comfortable max width).
-        - On desktop (md+) the actions are placed on the right and vertically centered.
-        - Buttons keep consistent spacing and do not overflow horizontally.
-      */}
       <Box
         sx={{
           display: "flex",
@@ -996,7 +1075,6 @@ export default function SubscriptionPage(): JSX.Element {
           </Typography>
         </Box>
 
-        {/* Buttons group */}
         <Box
           sx={{
             display: "flex",
@@ -1009,21 +1087,22 @@ export default function SubscriptionPage(): JSX.Element {
           }}
         >
           <Box sx={{ width: { xs: "90%", sm: "auto" }, maxWidth: { xs: 520, md: "none" } }}>
-            <Button
-              component={Link}
-              href="/dashboard"
-              variant="outlined"
-              fullWidth
-              sx={{
-                textTransform: "none",
-                whiteSpace: "nowrap",
-                fontWeight: 700,
-                borderRadius: 2,
-                py: 1.25,
-              }}
-            >
-              Back to Dashboard
-            </Button>
+            <Tooltip title={txTooltip}>
+              <Button
+                variant="outlined"
+                onClick={() => router.push("/transaction-history")}
+                fullWidth
+                sx={{
+                  textTransform: "none",
+                  whiteSpace: "nowrap",
+                  fontWeight: 700,
+                  borderRadius: 2,
+                  py: 1.25,
+                }}
+              >
+                Transaction history
+              </Button>
+            </Tooltip>
           </Box>
 
           <Box sx={{ width: { xs: "90%", sm: "auto" }, maxWidth: { xs: 520, md: "none" } }}>
@@ -1148,86 +1227,151 @@ export default function SubscriptionPage(): JSX.Element {
             <PaymentMethodDisplay token={token} />
 
             <Box sx={{ mt: 2 }}>
-              <Typography variant="subtitle2" sx={{ mb: 1 }}>
-                Plan limits
-              </Typography>
-              {getPlanLimits(resolvedPlan).map((line, i) => (
-                <Typography key={`${line}-${i}`} variant="body2" sx={{ py: 0.5 }}>
-                  • {line}
-                </Typography>
-              ))}
+              <Typography variant="h6" sx={{ mb: 1 }}>Billing help & support</Typography>
+
+              <Stack spacing={1}>
+                <Box>
+                  <Typography variant="body2" sx={{ fontWeight: 700 }}>Why is my invoice missing?</Typography>
+                  <Typography variant="caption" color="text.secondary" display="block">
+                    Invoices are generated after the payment gateway confirms the transaction. If you completed checkout, allow a minute and then refresh. You can also open the Billing portal to view receipts.
+                  </Typography>
+                </Box>
+
+                <Box>
+                  <Typography variant="body2" sx={{ fontWeight: 700 }}>I paid but my plan didn't update</Typography>
+                  <Typography variant="caption" color="text.secondary" display="block">
+                    Payments sometimes take a few moments to reconcile. If your status remains unchanged after a few minutes, open the Billing portal or contact support with your receipt.
+                  </Typography>
+                </Box>
+
+                <Box>
+                  <Typography variant="body2" sx={{ fontWeight: 700 }}>How can I get a receipt?</Typography>
+                  <Typography variant="caption" color="text.secondary" display="block">
+                    Receipts are available in the Billing portal and will be emailed to your account address when payment completes.
+                  </Typography>
+                </Box>
+
+                <Box>
+                  <Typography variant="body2" sx={{ fontWeight: 700 }}>Can I change my billing period?</Typography>
+                  <Typography variant="caption" color="text.secondary" display="block">
+                    Yes — use the Change plan flow or the billing portal to switch between monthly and yearly billing. Yearly billing usually provides a discount.
+                  </Typography>
+                </Box>
+
+                <Box>
+                  <Typography variant="body2" sx={{ fontWeight: 700 }}>Need more help?</Typography>
+                  <Typography variant="caption" color="text.secondary" display="block">
+                    Contact our billing team (include your account email and any receipt IDs) for fastest help.
+                  </Typography>
+                </Box>
+
+                <Box sx={{ display: "flex", gap: 1, mt: 1, flexWrap: "wrap" }}>
+                  <Button variant="contained" size="small" onClick={() => { window.location.href = "mailto:support@brainihi.com"; }}>
+                    Email support
+                  </Button>
+                  <Button variant="outlined" size="small" onClick={() => router.push("/contact")}>
+                    Help center
+                  </Button>
+                </Box>
+              </Stack>
             </Box>
           </Paper>
         </Grid>
 
         <Grid item xs={12} md={6}>
-          <Paper
-            sx={{
-              p: { xs: 2, md: 3 },
-              height: { xs: "auto", md: "70vh" },
-              overflowY: { xs: "visible", md: "auto" },
-            }}
-          >
-            <Typography variant="h6">Transaction history</Typography>
-            <Box sx={{ mt: 1 }}>
-              {pendingInvoices.length > 0 && (
-                <>
-                  <Typography variant="subtitle2" sx={{ mb: 1 }}>Pending invoices</Typography>
-                  <Stack spacing={1} sx={{ mb: 2 }}>
-                    {pendingInvoices.map((inv) => (
-                      <Paper key={inv.id} sx={{ p: 2 }}>
-                        <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 1, flexWrap: "wrap" }}>
-                          <Box sx={{ minWidth: 0 }}>
-                            <Typography sx={{ fontWeight: 700, wordBreak: "break-word" }}>{inv.plan}</Typography>
-                            <Typography variant="caption" color="text.secondary">{new Date(inv.issuedAt).toLocaleString()}</Typography>
-                            {(inv as any).reason === "change_plan" && (
-                              <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
-                                Change of plan invoice {(inv as any).changeTo ? `→ ${(inv as any).changeTo}` : ""}
-                              </Typography>
-                            )}
-                          </Box>
-                          <Box sx={{ display: "flex", gap: 1, alignItems: "center", ml: "auto" }}>
-                            <Typography sx={{ fontWeight: 700 }}>{inv.amount} {inv.currency}</Typography>
-                            {invoiceChip(inv)}
-                            <Button size="small" onClick={() => openInvoiceDialog(inv)} sx={{ textTransform: "none" }}>View</Button>
-                          </Box>
-                        </Box>
-                      </Paper>
-                    ))}
-                  </Stack>
-                </>
-              )}
+          <Stack spacing={2}>
+            <Paper sx={{ p: { xs: 2, md: 3 } }}>
+              <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 2, flexWrap: "wrap" }}>
+                <Box>
+                  <Typography variant="h6">Subscription insights</Typography>
+                  <Typography variant="subtitle2" sx={{ mt: 1 }}>Current plan</Typography>
+                  <Typography variant="h6" sx={{ fontWeight: 800 }}>{resolvedPlan}</Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    Status: <strong style={{ textTransform: "capitalize" }}>{billingInfo.status ?? "unknown"}</strong>
+                    {billingInfo.nextPayment ? ` • Next: ${new Date(billingInfo.nextPayment).toLocaleString()}` : " • No scheduled payment"}
+                  </Typography>
+                </Box>
 
-              <Typography variant="subtitle2" sx={{ mb: 1 }}>Recent payments</Typography>
-              {paidInvoices.length === 0 ? (
-                <Typography variant="body2" color="text.secondary">No payments recorded.</Typography>
-              ) : (
-                <Stack spacing={1}>
-                  {paidInvoices.map((inv) => (
-                    <Paper key={inv.id} sx={{ p: 2 }}>
-                      <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 1, flexWrap: "wrap" }}>
-                        <Box sx={{ minWidth: 0 }}>
-                          <Typography sx={{ fontWeight: 700, wordBreak: "break-word" }}>{inv.plan}</Typography>
-                          <Typography variant="caption" color="text.secondary">{new Date(inv.issuedAt).toLocaleString()}</Typography>
-                        </Box>
-                        <Box sx={{ display: "flex", gap: 1, alignItems: "center", ml: "auto" }}>
-                          <Typography sx={{ fontWeight: 700 }}>{inv.amount} {inv.currency}</Typography>
-                          {invoiceChip(inv)}
-                          <Button size="small" onClick={() => openInvoiceDialog(inv)} sx={{ textTransform: "none" }}>Receipt</Button>
-                        </Box>
-                      </Box>
-                    </Paper>
-                  ))}
-                </Stack>
-              )}
-            </Box>
-          </Paper>
+                <Box sx={{ display: "flex", gap: 1 }}>
+                  <Tooltip title={txTooltip}>
+                    <Button
+                      variant="outlined"
+                      onClick={() => router.push("/transaction-history")}
+                      sx={{ textTransform: "none", whiteSpace: "nowrap" }}
+                    >
+                      Transaction history
+                    </Button>
+                  </Tooltip>
+
+                  <Button variant="contained" onClick={() => handleOpenChangePlan()} sx={{ textTransform: "none" }}>
+                    Change plan
+                  </Button>
+                </Box>
+              </Box>
+
+              <Divider sx={{ my: 2 }} />
+
+              <Typography variant="subtitle2">Recommended actions</Typography>
+              <Stack spacing={1} sx={{ mt: 1 }}>
+                <Box sx={{ display: "flex", justifyContent: "space-between", gap: 1, flexWrap: "wrap" }}>
+                  <Box sx={{ minWidth: 0 }}>
+                    <Typography variant="body2" sx={{ fontWeight: 700 }}>Try Tutor for smarter learning</Typography>
+                    <Typography variant="caption" color="text.secondary">Personalized study plans and expanded AI explanations.</Typography>
+                  </Box>
+                  <Box sx={{ display: "flex", gap: 1 }}>
+                    <Button size="small" variant="contained" onClick={() => openCompletePaymentDialog("Tutor", "monthly")}>Explore Tutor</Button>
+                  </Box>
+                </Box>
+
+                <Box sx={{ display: "flex", justifyContent: "space-between", gap: 1, flexWrap: "wrap" }}>
+                  <Box sx={{ minWidth: 0 }}>
+                    <Typography variant="body2" sx={{ fontWeight: 700 }}>Save with yearly billing</Typography>
+                    <Typography variant="caption" color="text.secondary">Switch to yearly billing to reduce your monthly cost.</Typography>
+                  </Box>
+                  <Box sx={{ display: "flex", gap: 1 }}>
+                    <Button size="small" variant="outlined" onClick={() => openCompletePaymentDialog(resolvedPlan, "yearly")}>Switch to yearly</Button>
+                  </Box>
+                </Box>
+              </Stack>
+            </Paper>
+
+            <Paper sx={{ p: { xs: 2, md: 3 } }}>
+              <Typography variant="h6">Usage & limits</Typography>
+              <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 1 }}>
+                Plan: <strong>{resolvedPlan}</strong> • Billing: <strong>{billingFrequencyRaw}</strong>
+              </Typography>
+
+              <Divider sx={{ my: 2 }} />
+
+              <Typography variant="subtitle2">Plan limits</Typography>
+              <Stack spacing={1} sx={{ mt: 1 }}>
+                {getPlanLimits(resolvedPlan).map((line, i) => (
+                  <Box key={i} sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 1, flexWrap: "wrap" }}>
+                    <Typography variant="body2">• {line}</Typography>
+                    <Typography variant="caption" color="text.secondary">—</Typography>
+                  </Box>
+                ))}
+              </Stack>
+
+              <Divider sx={{ my: 2 }} />
+
+              <Typography variant="subtitle2">Quick actions</Typography>
+              <Box sx={{ mt: 1, display: "flex", gap: 1, flexWrap: "wrap" }}>
+                <Tooltip title={txTooltip}>
+                  <Button variant="outlined" size="small" onClick={() => router.push("/transaction-history")}>Transaction history</Button>
+                </Tooltip>
+                <Button variant="outlined" size="small" onClick={() => openCompletePaymentDialog(resolvedPlan, billingPeriod)}>Adjust billing</Button>
+                <Button variant="contained" size="small" onClick={() => handleOpenChangePlan()}>Upgrade plan</Button>
+                <Button variant="text" size="small" onClick={openPortal}>Open billing portal</Button>
+              </Box>
+            </Paper>
+          </Stack>
         </Grid>
       </Grid>
 
-      {/* Change plan dialog */}
+      {/* Change plan dialog - updated to show prices and billing toggle */}
       <Dialog open={changeOpen} onClose={() => setChangeOpen(false)} maxWidth="sm" fullWidth>
-        <DialogTitle>Upgrade plan</DialogTitle>
+        <DialogTitle>Change plan</DialogTitle>
         <DialogContent dividers>
           <Box sx={{ mt: 1 }}>
             <FormControl fullWidth>
@@ -1243,6 +1387,29 @@ export default function SubscriptionPage(): JSX.Element {
                 ))}
               </Select>
             </FormControl>
+
+            <Box sx={{ mt: 2, display: "flex", alignItems: "center", gap: 2, flexWrap: "wrap" }}>
+              <Typography variant="subtitle2">Billing period</Typography>
+              <ToggleButtonGroup
+                value={changeBillingPeriod}
+                exclusive
+                onChange={(_, val) => {
+                  if (!val) return;
+                  setChangeBillingPeriod(val);
+                }}
+                size="small"
+              >
+                <ToggleButton value="monthly">Monthly</ToggleButton>
+                <ToggleButton value="yearly">Yearly</ToggleButton>
+              </ToggleButtonGroup>
+
+              <Box sx={{ ml: "auto", textAlign: "right" }}>
+                <Typography variant="subtitle2">Price</Typography>
+                <Typography variant="h6" sx={{ fontWeight: 800 }}>
+                  {changeSelectedPlan ? `${mapPlanPrice(changeSelectedPlan, changeBillingPeriod).amount} ${mapPlanPrice(changeSelectedPlan, changeBillingPeriod).currency}` : "—"}
+                </Typography>
+              </Box>
+            </Box>
 
             <Box sx={{ mt: 2 }}>
               <Typography variant="subtitle2">Plan limits ({changeSelectedPlan ?? "—"})</Typography>
@@ -1372,5 +1539,4 @@ export default function SubscriptionPage(): JSX.Element {
       </Snackbar>
     </Container>
   );
-
 }

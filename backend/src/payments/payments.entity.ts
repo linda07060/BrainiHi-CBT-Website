@@ -38,19 +38,27 @@ export class Payment {
   @Column({ name: 'payer_name', type: 'varchar', length: 256, nullable: true })
   payerName: string | null;
 
-  // New: reason and change_to for invoice metadata (frontend will use these)
+  // reason and change_to for invoice metadata
   @Column({ name: 'reason', type: 'varchar', length: 40, nullable: true })
   reason: string | null;
 
   @Column({ name: 'change_to', type: 'varchar', length: 64, nullable: true })
   change_to: string | null;
 
-  // optional idempotency key (not required but useful)
+  // idempotency key (no longer used for uniqueness)
   @Column({ name: 'idempotency_key', type: 'varchar', length: 128, nullable: true })
   idempotencyKey: string | null;
 
+  // client-supplied token to dedupe retries / concurrent creates
+  @Column({ name: 'client_temp_id', type: 'varchar', length: 128, nullable: true })
+  clientTempId: string | null;
+
   @Column({ name: 'raw', type: 'jsonb', nullable: true })
   raw: any;
+
+  // minute-bucket for created_at (optional)
+  @Column({ name: 'created_at_minute', type: 'timestamptz', nullable: true })
+  createdAtMinute: Date | null;
 
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })
   createdAt: Date;
