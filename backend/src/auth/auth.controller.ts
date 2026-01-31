@@ -17,18 +17,11 @@ export class AuthController {
     private readonly ds: DataSource,
   ) {}
 
-  /**
-   * Helper: fetch the raw DB row for a user by id or email.
-   * Use `SELECT *` so we don't reference columns that may not exist in some schemas
-   * (avoids QueryFailedError when DB has different column names like no updated_at).
-   * We still normalize the returned row to read require/security flags reliably.
-   */
   private async fetchUserRow(idCandidate?: any, emailCandidate?: any): Promise<any | null> {
     try {
       if (idCandidate) {
         const idNum = Number(idCandidate);
         if (!Number.isNaN(idNum)) {
-          // Use SELECT * to avoid selecting non-existent columns.
           const sql = `SELECT * FROM "user" WHERE id = $1 LIMIT 1`;
           const rows = await this.ds.query(sql, [idNum]);
           if (Array.isArray(rows) && rows.length > 0) return rows[0];
@@ -44,7 +37,6 @@ export class AuthController {
 
       return null;
     } catch (err) {
-      // Log a focused warning and return null so callers fall back to repo/jwt payload.
       this.logger.warn('fetchUserRow failed', err as any);
       return null;
     }
@@ -54,41 +46,31 @@ export class AuthController {
   async login(@Body() body: { email: string; password: string }, @Req() req: Request) {
     const result: any = await this.authService.login(body);
 
-    // Fire-and-forget: record login activity using the returned JWT payload (contains sub/email).
-    // Be defensive: if result.user is not present, construct a minimal payload from result.
     try {
       const payload = (result && (result as any).user)
         ? (result as any).user
-        : // fallback: try to extract from common shapes
-          {
+        : {
             sub: (result && (result as any).sub) || null,
             email: (result && (result as any).user && (result as any).user.email) || body.email || null,
           };
 
-      // Only call if we at least have an email or sub
       if (payload && (payload.sub || payload.email)) {
-        // do not await; swallow any rejection so login isn't blocked
         this.authService.recordLoginFromPayload(payload, req).catch(() => {});
       }
     } catch {
-      // swallow any synchronous errors
+      // swallow
     }
 
-    // Normalize response so frontend can detect require_security_setup and require_passphrase_setup reliably.
-    // Determine token and user payload from result in common shapes.
     const token = result?.access_token ?? result?.token ?? result?.accessToken ?? null;
     const returnedUser = result?.user ?? result;
 
     let freshUser: any = null;
     try {
-      // Try to resolve a fresh user record from DB to pick up current require flags.
       const idCandidate = (returnedUser && (returnedUser.id ?? returnedUser.sub ?? returnedUser.user_id)) ?? null;
       const emailCandidate = (returnedUser && (returnedUser.email ?? returnedUser.user_email)) ?? body.email ?? null;
 
-      // Prefer raw DB row (explicit select) so we pick up exact DB columns and values
       freshUser = await this.fetchUserRow(idCandidate, emailCandidate);
 
-      // If explicit raw select didn't find anything, attempt ORM repository (fallback)
       if (!freshUser) {
         if (idCandidate) {
           const idNum = Number(idCandidate);
@@ -105,20 +87,20 @@ export class AuthController {
       freshUser = null;
     }
 
-    // Build sanitized user object to return to frontend (do not expose recovery hash to normal users)
     const src = freshUser ?? returnedUser ?? {};
 
-    const sanitizedUser = {
+    const sanitizedUser: any = {
       id: src.id ?? src.sub ?? null,
       email: src.email ?? null,
       name: src.name ?? null,
-      // Expose normalized require flags (boolean)
       require_security_setup: !!(src.require_security_setup ?? src.requireSecuritySetup ?? false),
       require_passphrase_setup: !!(src.require_passphrase_setup ?? src.requirePassphraseSetup ?? false),
       securityConfigured: !!(src.securityConfigured ?? src.security_configured ?? false),
-      // include any non-sensitive display fields the frontend might expect
       user_uid: src.user_uid ?? src.userUid ?? null,
       created_at: src.created_at ?? src.createdAt ?? null,
+      // include plan / expiry so frontends can immediately show plan
+      plan: src.plan ?? null,
+      plan_expiry: src.plan_expiry ?? src.planExpiry ?? null,
     };
 
     if (token) {
@@ -153,10 +135,8 @@ export class AuthController {
       const idCandidate = jwtUser.sub ?? jwtUser.id ?? jwtUser.user_id;
       const emailCandidate = jwtUser.email ?? jwtUser.user_email;
 
-      // Prefer explicit DB raw select to pick up actual stored require flags
       freshUser = await this.fetchUserRow(idCandidate, emailCandidate);
 
-      // Fallback to repository if raw select didn't find anything
       if (!freshUser) {
         if (idCandidate) {
           const idNum = Number(idCandidate);
@@ -180,6 +160,9 @@ export class AuthController {
         securityConfigured: !!(src.securityConfigured ?? src.security_configured ?? false),
         user_uid: src.user_uid ?? src.userUid ?? null,
         created_at: src.created_at ?? src.createdAt ?? null,
+        // expose plan info here too
+        plan: src.plan ?? null,
+        plan_expiry: src.plan_expiry ?? src.planExpiry ?? null,
       };
     } catch (err) {
       this.logger.warn('Failed to fetch fresh user record for /auth/me', err as any);
@@ -189,6 +172,8 @@ export class AuthController {
         name: jwtUser.name ?? null,
         require_security_setup: !!(jwtUser.require_security_setup ?? jwtUser.requireSecuritySetup ?? false),
         require_passphrase_setup: !!(jwtUser.require_passphrase_setup ?? jwtUser.requirePassphraseSetup ?? false),
+        plan: jwtUser.plan ?? null,
+        plan_expiry: jwtUser.plan_expiry ?? null,
       };
     }
   }
@@ -207,9 +192,7 @@ export class AuthController {
 
   @Get('google')
   @UseGuards(AuthGuard('google'))
-  async googleAuth() {
-    // Passport redirects to Google
-  }
+  async googleAuth() {}
 
   @Get('google/callback')
   @UseGuards(AuthGuard('google'))
@@ -220,9 +203,7 @@ export class AuthController {
       if (payload && (payload.sub || payload.email)) {
         this.authService.recordLoginFromPayload(payload, req).catch(() => {});
       }
-    } catch {
-      // swallow; do not prevent redirect
-    }
+    } catch {}
     return res.redirect(`${process.env.FRONTEND_ORIGIN}/login?token=${data.access_token}`);
   }
 

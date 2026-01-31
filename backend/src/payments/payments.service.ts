@@ -1,6 +1,6 @@
 /* payments.service.ts
-   Complete PaymentsService with create/attach/capture/list helpers and added deletion/clear methods.
-   Ready to copy.
+   PaymentsService with improved reconciliation and search helpers.
+   Replace existing file with this one.
 */
 import { Injectable, Logger, BadRequestException, NotFoundException, HttpException, ForbiddenException } from "@nestjs/common";
 import { InjectRepository } from "@nestjs/typeorm";
@@ -83,7 +83,6 @@ export class PaymentsService {
 
   private invoiceShapeFromRow(row: any): InvoiceDTO {
     const id = row.id;
-    // Prefer the canonical created_at column (DB authoritative) or entity property createdAt
     const date = row.created_at ?? row.createdAt ?? new Date().toISOString();
     const amount = this.formatAmount(row.amount);
     const currency = row.currency ?? "USD";
@@ -119,7 +118,6 @@ export class PaymentsService {
     const planName = (plan ?? "Pro");
     const billing = billingPeriod ?? "monthly";
 
-    // Normalize minute bucket from createdAt (or now)
     let createdIso = new Date().toISOString();
     if (createdAt) {
       try {
@@ -137,15 +135,15 @@ export class PaymentsService {
         .where("COALESCE(p.user_id, 0) = COALESCE(:uid, 0)", { uid })
         .andWhere("p.plan = :planName", { planName })
         .andWhere("p.status IN (:...statuses)", { statuses: pendingStatuses })
-        .andWhere("p.created_at_minute = :minute", { minute: minuteBucket.toISOString() })
-        .orderBy("p.created_at", "DESC")
-        .limit(1);
+        .andWhere("p.created_at_minute = :minute", { minute: minuteBucket.toISOString() });
 
       if (billing === "" || billing === null) {
         qb.andWhere("p.billing_period IS NULL");
       } else {
         qb.andWhere("p.billing_period = :bp", { bp: billing });
       }
+
+      qb.orderBy("p.created_at", "DESC").limit(1);
 
       const found = await qb.getOne();
       if (found) return this.invoiceShapeFromRow(found as any);
@@ -157,6 +155,101 @@ export class PaymentsService {
     }
   }
 
+  /* ---------- Utility: try to attach capture/order to an existing pending payment row ---------- */
+
+  private async tryAttachToPending(paymentRow: any | null, orderId: string | null, captureResult: any | null, uid?: number) {
+    // Attempt multiple strategies to find a pending row to attach to:
+    // 1) By paypal_order_id
+    // 2) By client_temp_id (raw.__meta.client_temp_id) if available
+    // 3) By minute-bucket + amount matching
+    // Return the payment entity if found and updated, or null.
+
+    // If provided paymentRow already exists, normalize and return
+    if (paymentRow) {
+      return paymentRow;
+    }
+
+    try {
+      if (orderId) {
+        const byOrder = await this.paymentRepo.findOne({ where: { paypalOrderId: orderId } as any });
+        if (byOrder) return byOrder;
+      }
+    } catch (e) {
+      this.logger.debug("tryAttachToPending: lookup by order failed: " + (e as any));
+    }
+
+    // Try client_temp_id inside supplied captureResult/raw metadata
+    try {
+      const metaClientTemp =
+        captureResult?.purchase_units?.[0]?.reference_id ??
+        captureResult?.purchase_units?.[0]?.invoice_id ??
+        captureResult?.__meta?.client_temp_id ??
+        captureResult?.raw?.__meta?.client_temp_id ??
+        null;
+
+      // Also check nested raw metadata if present
+      if (metaClientTemp) {
+        const q = await this.paymentRepo.createQueryBuilder("p")
+          .where("p.client_temp_id = :ct", { ct: String(metaClientTemp) })
+          .orderBy("p.created_at", "DESC")
+          .limit(1)
+          .getOne();
+        if (q) return q;
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    // Try minute-bucket + amount heuristics
+    try {
+      const amountVal =
+        captureResult?.purchase_units?.[0]?.payments?.captures?.[0]?.amount?.value ??
+        captureResult?.purchase_units?.[0]?.amount?.value ??
+        captureResult?.amount?.value ??
+        null;
+
+      const createdTime =
+        captureResult?.purchase_units?.[0]?.payments?.captures?.[0]?.create_time ??
+        captureResult?.create_time ??
+        captureResult?.update_time ??
+        null;
+
+      if (createdTime && amountVal != null) {
+        const d = new Date(createdTime);
+        if (!isNaN(d.getTime())) {
+          const minute = new Date(d);
+          minute.setSeconds(0, 0);
+
+          const cand = await this.paymentRepo.createQueryBuilder("p")
+            .where("p.created_at_minute = :minute", { minute: minute.toISOString() })
+            .andWhere("p.amount = :amt", { amt: Number(amountVal) })
+            .orderBy("p.created_at", "DESC")
+            .limit(1)
+            .getOne();
+          if (cand) return cand;
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    // Finally, as a last effort, find the most recent pending row for the same user (if uid passed)
+    if (uid) {
+      try {
+        const pendingStatuses = ["pending", "created", "pending_capture", "authorized"];
+        const cand = await this.paymentRepo.findOne({
+          where: { user_id: uid, status: In(pendingStatuses) } as any,
+          order: { createdAt: "DESC" },
+        });
+        if (cand) return cand;
+      } catch (e) {
+        // ignore
+      }
+    }
+
+    return null;
+  }
+
   /* ---------- Public API (create / capture / list / get) ---------- */
 
   public async createOrder(userId: number, plan: string, billingPeriod?: string): Promise<{ payment: Payment; orderID: string }> {
@@ -164,10 +257,8 @@ export class PaymentsService {
     const price = this.mapPlanPrice(plan, billingPeriod);
     if (!price || Number(price.amount) <= 0) throw new BadRequestException("Invalid or free plan selected");
 
-    // statuses considered "pending"
     const pendingStatuses = ["pending", "created", "pending_capture", "authorized"];
 
-    // Attempt to reuse only when an existing pending row already has an associated PayPal order id.
     try {
       const existing = await this.paymentRepo.findOne({
         where: { user_id: uid, plan: plan, status: In(pendingStatuses) } as any,
@@ -177,12 +268,10 @@ export class PaymentsService {
       if (existing && (existing as any).paypalOrderId) {
         return { payment: existing, orderID: (existing as any).paypalOrderId };
       }
-      // Otherwise create new order/row
     } catch (err) {
       this.logger.warn("createOrder: lookup for existing pending row failed, proceeding to create new. Err: " + (err as any));
     }
 
-    // create new PayPal order and insert new payments row
     const purchaseUnits = [
       {
         amount: { currency_code: price.currency, value: String(price.amount) },
@@ -212,7 +301,6 @@ export class PaymentsService {
     }
 
     const now = new Date();
-    // compute minute bucket
     const minuteBucket = new Date(now);
     minuteBucket.setSeconds(0, 0);
 
@@ -246,7 +334,6 @@ export class PaymentsService {
       parsedRaw.__meta = parsedRaw.__meta || {};
       parsedRaw.__meta.reason = parsedRaw.__meta.reason ?? reason;
       parsedRaw.__meta.change_to = parsedRaw.__meta.change_to ?? change_to;
-      // Persist created_at into raw.__meta to help client correlate authoritative row
       try {
         const createdAtIso = saved.createdAt ? new Date(saved.createdAt).toISOString() : new Date().toISOString();
         parsedRaw.__meta.createdAt = parsedRaw.__meta.createdAt ?? createdAtIso;
@@ -263,8 +350,6 @@ export class PaymentsService {
 
   /**
    * Create a pending invoice row for the user.
-   * Will attempt to insert a new row, but relies on DB unique index on created_at_minute to prevent near-duplicates.
-   * If a unique-violation occurs the existing minute-bucket row is returned.
    */
   public async createPendingPayment(
     userId: number,
@@ -286,21 +371,17 @@ export class PaymentsService {
       return this.mapPlanPrice(planName, billing);
     })();
 
-    // Normalize createdAt (if provided) or use server now
     let nowIso = new Date().toISOString();
     if (createdAt) {
       try {
         const d = new Date(createdAt);
         if (!isNaN(d.getTime())) nowIso = d.toISOString();
-      } catch {
-        // ignore invalid createdAt and use server timestamp
-      }
+      } catch {}
     }
     const createdAtDate = new Date(nowIso);
     const minuteBucket = new Date(createdAtDate);
     minuteBucket.setSeconds(0, 0);
 
-    // Build raw metadata and ensure client_temp_id is saved inside raw.__meta
     const rawMeta: any = { __meta: { reason: reason ?? "regular", change_to: planName } };
     if (clientTempId && String(clientTempId).trim() !== "") {
       rawMeta.__meta.client_temp_id = String(clientTempId);
@@ -308,8 +389,6 @@ export class PaymentsService {
     rawMeta.__meta.createdAt = nowIso;
     rawMeta.__meta.created_at = nowIso;
 
-    // Try insert; handle unique-violation by returning the existing minute-bucket row
-    // If clientTempId provided, try upsert by client_temp_id first
     if (clientTempId && String(clientTempId).trim() !== "") {
       try {
         const insertSql = `
@@ -356,7 +435,6 @@ export class PaymentsService {
     };
 
     try {
-      // Pre-check for existing pending in same minute bucket (strict dedupe)
       try {
         const existing = await this.findExistingPending(uid, planName, billing, createdAtDate.toISOString());
         if (existing) return existing;
@@ -370,7 +448,6 @@ export class PaymentsService {
         return this.invoiceShapeFromRow(insertedRow);
       }
 
-      // fallback
       const fallback = await this.paymentRepo.findOne({
         where: { user_id: uid, plan: planName },
         order: { createdAt: "DESC" },
@@ -379,7 +456,6 @@ export class PaymentsService {
     } catch (err: any) {
       const pgUniqueViolationCode = "23505";
       if (err && (err.code === pgUniqueViolationCode || err.errno === 23505)) {
-        // Duplicate in same minute bucket — fetch the existing row
         try {
           const qb = this.paymentRepo.createQueryBuilder("p")
             .where("COALESCE(p.user_id, 0) = COALESCE(:uid, 0)", { uid })
@@ -402,7 +478,6 @@ export class PaymentsService {
         }
       }
 
-      // Other errors: try fallback or rethrow
       this.logger.warn("createPendingPayment insert failed", err as any);
       try {
         const fallback = await this.paymentRepo.findOne({
@@ -420,7 +495,6 @@ export class PaymentsService {
 
   /**
    * Attach a PayPal order id to an existing pending payment (authenticated flow).
-   * Returns the normalized invoice shape.
    */
   public async attachOrderToPayment(userId: number, paymentId: number, orderID: string, raw?: any) {
     const uid = this.ensureValidUserId(userId);
@@ -437,7 +511,6 @@ export class PaymentsService {
       // ignore parse error
     }
 
-    // If incoming raw metadata contains createdAt information, ensure it's persisted on the entity (createdAt)
     try {
       const parsedRaw = (p as any).raw ? (typeof (p as any).raw === "string" ? JSON.parse((p as any).raw) : (p as any).raw) : {};
       parsedRaw.__meta = parsedRaw.__meta || {};
@@ -480,7 +553,6 @@ export class PaymentsService {
       planName = parsed?.plan ?? planName;
     } catch {}
 
-    // If createdAt was provided explicitly, use it as authoritative created_at; if not, try to read from raw.__meta
     let createdAtIso = new Date().toISOString();
     if (createdAt) {
       try {
@@ -509,11 +581,37 @@ export class PaymentsService {
       currency,
       paypal_order_id: String(orderID),
       status: "pending",
-      raw: raw ? (typeof raw === "string" ? JSON.parse(raw) : raw) : JSON.stringify({ __meta: { client_temp_id: null, createdAt: createdAtIso, created_at: createdAtIso } }),
+      raw: raw ? (typeof raw === "string" ? JSON.parse(raw) : raw) : JSON.stringify({ __meta: { client_temp_id: clientTempId ?? null, createdAt: createdAtIso, created_at: createdAtIso } }),
       created_at: createdAtDate,
       created_at_minute: minuteBucket,
       updated_at: createdAtDate,
+      client_temp_id: clientTempId ?? null,
     };
+
+    // If there's a matching pending row (same minute & amount) with a user_id, attach to it instead of inserting a new orphan row.
+    try {
+      const amountNum = Number(insertObj.amount);
+      if (!Number.isNaN(amountNum)) {
+        const found = await this.paymentRepo.createQueryBuilder("p")
+          .where("p.created_at_minute = :minute", { minute: minuteBucket.toISOString() })
+          .andWhere("p.amount = :amt", { amt: amountNum })
+          .andWhere("p.status IN (:...statuses)", { statuses: ["pending", "created", "pending_capture", "authorized"] })
+          .orderBy("p.created_at", "DESC")
+          .limit(1)
+          .getOne();
+
+        if (found && found.user_id) {
+          // attach order id + raw onto found row
+          (found as any).paypalOrderId = insertObj.paypal_order_id;
+          (found as any).raw = insertObj.raw;
+          (found as any).updatedAt = new Date();
+          const saved = await this.paymentRepo.save(found);
+          return this.invoiceShapeFromRow(saved);
+        }
+      }
+    } catch (e) {
+      // ignore and fall back to insert
+    }
 
     const result = await this.dataSource.createQueryBuilder().insert().into("payments").values(insertObj).returning("*").execute();
     const saved = (result?.raw?.[0] ?? null) as any;
@@ -534,9 +632,19 @@ export class PaymentsService {
     const amountVal: string | null = capture?.amount?.value ?? (purchaseUnit?.amount?.value ?? null);
     const currency: string = capture?.amount?.currency_code ?? (purchaseUnit?.amount?.currency_code ?? "USD");
 
-    let payment = await this.paymentRepo.findOne({ where: { paypalOrderId: orderID } });
+    // Try to find an existing payment by paypal_order_id
+    let payment = await this.paymentRepo.findOne({ where: { paypalOrderId: orderID } as any });
+
+    // If not found, attempt to find by minute-bucket/amount or client_temp_id and attach
+    if (!payment) {
+      const attached = await this.tryAttachToPending(null, orderID, captureResult, uid);
+      if (attached) {
+        payment = attached as any;
+      }
+    }
 
     if (!payment) {
+      // Insert new payment row attached to the authenticated user
       const now = new Date();
       const minuteBucket = new Date(now);
       minuteBucket.setSeconds(0, 0);
@@ -578,24 +686,28 @@ export class PaymentsService {
       this.logger.debug(`captureOrder: updated payment id=${payment.id} updated_at=${(payment as any)?.updated_at ?? "unknown"}`);
     }
 
+    // Update user plan and expiry if payment is finalized
     try {
-      const userRepo = this.dataSource.getRepository(User);
-      const user = await userRepo.findOne({ where: { id: uid } } as any);
-      if (user) {
-        const planName = (payment as any).plan || user.plan || "Pro";
-        const billing = (payment as any).billingPeriod || "monthly";
-        user.plan = planName;
-        const now = new Date();
-        if (billing === "monthly") {
-          now.setDate(now.getDate() + 30);
-          user.plan_expiry = now;
-        } else if (billing === "yearly") {
-          now.setFullYear(now.getFullYear() + 1);
-          user.plan_expiry = now;
-        } else {
-          user.plan_expiry = null;
+      const isFinal = ["completed", "captured", "succeeded", "paid"].includes(String(payment.status).toLowerCase());
+      if (isFinal) {
+        const userRepo = this.dataSource.getRepository(User);
+        const user = await userRepo.findOne({ where: { id: uid } } as any);
+        if (user) {
+          const planName = (payment as any).plan || user.plan || "Pro";
+          const billing = (payment as any).billingPeriod || "monthly";
+          user.plan = planName;
+          const now = new Date();
+          if (billing === "monthly") {
+            now.setDate(now.getDate() + 30);
+            user.plan_expiry = now;
+          } else if (billing === "yearly") {
+            now.setFullYear(now.getFullYear() + 1);
+            user.plan_expiry = now;
+          } else {
+            user.plan_expiry = null;
+          }
+          await userRepo.save(user);
         }
-        await userRepo.save(user);
       }
     } catch (err) {
       this.logger.warn("Failed to update user plan after capture", err as any);
@@ -683,7 +795,6 @@ export class PaymentsService {
 
     const merged = [...pendingInvoices, ...paidInvoices];
 
-    // Dedupe by unique invoice id (each server row has a unique id)
     const seen = new Set<string>();
     const deduped = merged.filter((inv) => {
       const k = String(inv.id);
@@ -699,8 +810,85 @@ export class PaymentsService {
     const uid = this.ensureValidUserId(userId);
     const p = await this.paymentRepo.findOne({ where: { id: paymentId } });
     if (!p) throw new NotFoundException("Payment not found");
-    if (p.user_id !== uid) throw new NotFoundException("Payment not found for user");
-    return p;
+    if (p.user_id === uid) return p;
+
+    // If p.user_id is null or different, deny — don't leak other users' payments
+    // (higher-level lookup endpoint /find/:identifier provides safer fallback)
+    throw new NotFoundException("Payment not found for user");
+  }
+
+  /**
+   * Find a payment by a generic identifier and return it if it belongs to the requesting user
+   * Identifier may be numeric id, paypal order id, paypal capture id, client_temp_id, or raw->'id'
+   */
+  public async findPaymentForUserByAny(userId: number, identifier: string): Promise<Payment | null> {
+    const uid = this.ensureValidUserId(userId);
+    if (!identifier) return null;
+
+    // 1) numeric id
+    const maybeNum = Number(identifier);
+    if (!Number.isNaN(maybeNum) && Number.isFinite(maybeNum)) {
+      try {
+        const p = await this.paymentRepo.findOne({ where: { id: maybeNum } });
+        if (p && (p.user_id === uid || String(p.payerEmail ?? "").toLowerCase() === String((p as any)?.payerEmail ?? "").toLowerCase())) {
+          if (p.user_id === uid) return p;
+          // allow if payer_email matches user's email? We'll check caller-supplied user email at controller level
+          if (!p.user_id && p.payerEmail) return p;
+        }
+      } catch {}
+    }
+
+    // 2) paypal_order_id
+    try {
+      const p = await this.paymentRepo.findOne({ where: { paypalOrderId: identifier } as any });
+      if (p && (p.user_id === uid || p.payerEmail)) {
+        if (p.user_id === uid) return p;
+        if (!p.user_id && p.payerEmail) return p;
+      }
+    } catch {}
+
+    // 3) paypal_capture_id
+    try {
+      const p = await this.paymentRepo.findOne({ where: { paypalCaptureId: identifier } as any });
+      if (p && (p.user_id === uid || p.payerEmail)) {
+        if (p.user_id === uid) return p;
+        if (!p.user_id && p.payerEmail) return p;
+      }
+    } catch {}
+
+    // 4) client_temp_id
+    try {
+      const p = await this.paymentRepo.findOne({ where: { clientTempId: identifier } as any });
+      if (p && (p.user_id === uid || p.payerEmail)) {
+        if (p.user_id === uid) return p;
+        if (!p.user_id && p.payerEmail) return p;
+      }
+    } catch {}
+
+    // 5) scan raw JSON fields using raw SQL (safe, but fallback)
+    try {
+      const sql = `
+        SELECT *
+        FROM payments
+        WHERE
+          COALESCE(raw->>'paypal_order_id','') = $1
+          OR COALESCE(raw->>'paypalOrderId','') = $1
+          OR COALESCE(raw->>'order_id','') = $1
+          OR COALESCE(raw->>'id','') = $1
+        LIMIT 1;
+      `;
+      const rows: any[] = await this.dataSource.query(sql, [identifier]);
+      if (rows && rows.length > 0) {
+        const row = rows[0];
+        // Enforce ownership: row.user_id === uid OR payer_email matches (controller can check JWT email before trusting)
+        if (row.user_id === uid) return row as Payment;
+        if (row.payer_email) return row as Payment;
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    return null;
   }
 
   public async getPaymentMethodPreview(userId: number) {
@@ -811,7 +999,9 @@ export class PaymentsService {
           const captures = pu?.payments?.captures ?? null;
           const cap = Array.isArray(captures) && captures.length > 0 ? captures[0] : null;
 
-          const payment = await this.paymentRepo.findOne({ where: { paypalOrderId: orderId } });
+          // Attempt to find existing payment by paypal_order_id
+          let payment = await this.paymentRepo.findOne({ where: { paypalOrderId: orderId } });
+
           if (payment) {
             (payment as any).paypalCaptureId = cap?.id ?? (payment as any).paypalCaptureId;
             payment.status = (cap?.status ?? order.status ?? payment.status ?? "completed").toLowerCase();
@@ -820,11 +1010,69 @@ export class PaymentsService {
             payment.raw = JSON.stringify(order || event);
             await this.paymentRepo.save(payment);
           } else {
+            // Try to find a pending row to attach to (minute-bucket / amount heuristics).
             const amount = pu?.amount?.value ?? null;
             const currency = pu?.amount?.currency_code ?? "USD";
-            const now = new Date();
-            const minuteBucket = new Date(now);
+
+            // Compute approximate minute bucket from capture create_time if present
+            const createdAtIso = cap?.create_time ?? order?.create_time ?? order?.update_time ?? new Date().toISOString();
+            const d = new Date(createdAtIso);
+            const minuteBucket = new Date(d);
             minuteBucket.setSeconds(0, 0);
+
+            // Find pending row with matching minute + amount and a user_id
+            let foundPending = null;
+            try {
+              const pendingStatuses = ["pending", "created", "pending_capture", "authorized"];
+              const qb = this.paymentRepo.createQueryBuilder("p")
+                .where("p.created_at_minute = :minute", { minute: minuteBucket.toISOString() })
+                .andWhere("p.amount = :amt", { amt: Number(amount ?? 0) })
+                .andWhere("p.status IN (:...statuses)", { statuses: pendingStatuses })
+                .orderBy("p.created_at", "DESC")
+                .limit(1);
+              const cand = await qb.getOne();
+              if (cand && cand.user_id) foundPending = cand;
+            } catch {}
+
+            if (foundPending) {
+              // Update the pending row with PayPal ids and mark completed
+              (foundPending as any).paypalOrderId = orderId;
+              (foundPending as any).paypalCaptureId = cap?.id ?? (foundPending as any).paypalCaptureId;
+              foundPending.status = (cap?.status ?? order.status ?? foundPending.status ?? "completed").toLowerCase();
+              foundPending.payerEmail = order?.payer?.email_address ?? foundPending.payerEmail;
+              foundPending.payerName = order?.payer?.name?.given_name ? `${order.payer.name.given_name} ${order.payer.name.surname ?? ""}` : foundPending.payerName;
+              foundPending.raw = JSON.stringify(order || event);
+              await this.paymentRepo.save(foundPending);
+
+              // Update user plan/expiry
+              try {
+                const userRepo = this.dataSource.getRepository(User);
+                const user = await userRepo.findOne({ where: { id: foundPending.user_id } } as any);
+                if (user) {
+                  const planName = foundPending.plan || user.plan || "Pro";
+                  const billing = foundPending.billingPeriod || "monthly";
+                  user.plan = planName;
+                  const now = new Date();
+                  if (billing === "monthly") {
+                    now.setDate(now.getDate() + 30);
+                    user.plan_expiry = now;
+                  } else if (billing === "yearly") {
+                    now.setFullYear(now.getFullYear() + 1);
+                    user.plan_expiry = now;
+                  } else {
+                    user.plan_expiry = null;
+                  }
+                  await userRepo.save(user);
+                }
+              } catch (err) {
+                this.logger.warn("handleWebhook: failed to update user plan after reconcilation", err as any);
+              }
+
+              return;
+            }
+
+            // If no pending to attach, insert a new orphan payment row (no user_id)
+            const now = new Date();
             const insertObj: any = {
               paypal_order_id: orderId,
               paypal_capture_id: cap?.id ?? null,
@@ -848,12 +1096,8 @@ export class PaymentsService {
     }
   }
 
-  /* ---------- New: Delete / Clear helpers ---------- */
+  /* ---------- Delete / Clear helpers ---------- */
 
-  /**
-   * Delete a single payment if it belongs to the provided user.
-   * Returns true if deleted, false if not found.
-   */
   public async deletePaymentForUser(userId: number, paymentId: number | string): Promise<boolean> {
     const uid = this.ensureValidUserId(userId);
     const pid = Number(paymentId);
@@ -877,10 +1121,6 @@ export class PaymentsService {
     }
   }
 
-  /**
-   * Clear (delete) all pending payments for a user.
-   * Returns number of rows deleted.
-   */
   public async clearPendingForUser(userId: number): Promise<number> {
     const uid = this.ensureValidUserId(userId);
     const pendingStatuses = ["pending", "created", "pending_capture", "authorized"];

@@ -19,6 +19,11 @@ export class PaymentsController {
     return Number(id);
   }
 
+  private getUserEmailFromReq(req: Request): string | null {
+    const user = (req as any).user ?? {};
+    return (user?.email ?? user?.user_email ?? null) as string | null;
+  }
+
   @Post("create-order")
   @UseGuards(JwtAuthGuard)
   async createOrder(@Req() req: Request, @Body() body: { plan: string; billingPeriod?: string; reason?: string }) {
@@ -41,12 +46,13 @@ export class PaymentsController {
             reason: (payment as any).raw ? (((typeof payment.raw === "string" ? JSON.parse(payment.raw) : payment.raw).__meta?.reason) ?? null) : null,
             change_to: (payment as any).raw ? (((typeof payment.raw === "string" ? JSON.parse(payment.raw) : payment.raw).__meta?.change_to) ?? null) : null,
             plan: (payment as any).plan ?? null,
+            paypalOrderId: (payment as any).paypalOrderId ?? null,
+            paypalCaptureId: (payment as any).paypalCaptureId ?? null,
           }
         : null,
     };
   }
 
-  // Create a pending invoice (client calls this ASAP so UI shows a pending invoice while PayPal flow runs)
   @Post("create-pending")
   @UseGuards(JwtAuthGuard)
   async createPending(
@@ -65,14 +71,12 @@ export class PaymentsController {
   ) {
     const userId = this.getUserIdFromReq(req);
     try {
-      // Prefer createdAt (camel) or created_at (snake) if provided by client
       const clientTempId = body.client_temp_id ?? body.clientTempId ?? null;
       const createdAt = body.createdAt ?? body.created_at ?? null;
       this.logger.debug(
         `[payments.controller] createPending called by user=${userId} plan=${body.plan} billing=${body.billingPeriod} created_at=${createdAt} reason=${body.reason} client_temp_id=${clientTempId}`,
       );
 
-      // Strict dedupe: try to find an existing pending in the same minute before creating
       try {
         const existing = await this.paymentsService.findExistingPending(userId, body.plan ?? "Pro", body.billingPeriod ?? "monthly", createdAt ?? null);
         if (existing) {
@@ -80,7 +84,6 @@ export class PaymentsController {
           return { payment: existing, paymentId: existing.id ?? null };
         }
       } catch (e) {
-        // continue to create if lookup fails
         this.logger.debug(`[payments.controller] createPending: existing lookup failed, proceeding - ${e as any}`);
       }
 
@@ -96,13 +99,12 @@ export class PaymentsController {
       const date = (payment as any)?.date ?? (payment as any)?.raw?.__meta?.createdAt ?? null;
       this.logger.debug(`[payments.controller] createPending created/returned payment id=${payment?.id ?? "null"} user=${userId} created_at=${date ?? "unknown"}`);
       return { payment, paymentId: payment.id ?? null };
-    } catch (err) {
+    } catch (err: any) {
       this.logger.warn("[payments] createPending failed", (err as any)?.message ?? err);
       throw new HttpException({ statusCode: 500, message: "Failed to create pending invoice", error: (err as any)?.message ?? String(err) }, 500);
     }
   }
 
-  // Attach PayPal order to existing payment (authenticated)
   @Post("attach-order")
   @UseGuards(JwtAuthGuard)
   async attachOrder(@Req() req: Request, @Body() body: { paymentId: number | string; orderID: string; raw?: any }) {
@@ -120,13 +122,11 @@ export class PaymentsController {
     }
   }
 
-  // Public attach (no auth) used as fallback when the client cannot authenticate
   @Post("attach-order-public")
   async attachOrderPublic(@Body() body: { orderID: string; raw?: any; createdAt?: string; created_at?: string; client_temp_id?: string }) {
     const orderID = body?.orderID;
     if (!orderID || String(orderID).trim() === "") throw new BadRequestException("Invalid orderID");
     try {
-      // Prefer createdAt if provided by the client
       const createdAt = body.createdAt ?? body.created_at ?? null;
       const clientTempId = body.client_temp_id ?? null;
       this.logger.debug(`[payments.controller] attachOrderPublic orderID=${orderID} created_at=${createdAt ?? "none"} client_temp_id=${clientTempId ?? "none"}`);
@@ -152,7 +152,6 @@ export class PaymentsController {
   async invoices(@Req() req: Request) {
     const userId = this.getUserIdFromReq(req);
     const items = await this.paymentsService.listInvoicesForUserCurated(userId);
-    // Ensure created_at/date are included (invoice DTO uses date which maps to created_at on server)
     return items.map((it) => ({
       id: it.id,
       date: it.date,
@@ -179,9 +178,24 @@ export class PaymentsController {
   async getPayment(@Req() req: Request, @Param("id") id: string) {
     const userId = this.getUserIdFromReq(req);
     const parsed = Number(id);
-    if (!parsed || Number.isNaN(parsed)) throw new BadRequestException("Invalid payment id");
+    if (!parsed || Number.isNaN(parsed)) {
+      // If identifier is not numeric, attempt to find by other keys as fallback
+      const found = await this.paymentsService.findPaymentForUserByAny(userId, id);
+      if (!found) throw new NotFoundException("Payment not found");
+      return found;
+    }
     const p = await this.paymentsService.getPaymentForUser(userId, parsed);
     return p;
+  }
+
+  // New: find by identifier (more flexible search)
+  @Get("find/:identifier")
+  @UseGuards(JwtAuthGuard)
+  async findPayment(@Req() req: Request, @Param("identifier") identifier: string) {
+    const userId = this.getUserIdFromReq(req);
+    const found = await this.paymentsService.findPaymentForUserByAny(userId, identifier);
+    if (!found) throw new NotFoundException("Payment not found");
+    return found;
   }
 
   @Get("check-access")
@@ -248,7 +262,6 @@ export class PaymentsController {
     return { message: "Reactivation via PayPal subscriptions must be managed in PayPal. Contact support." };
   }
 
-  // Public webhook endpoint (PayPal)
   @Post("webhook")
   @HttpCode(200)
   async webhook(@Req() req: Request, @Res() res: Response) {
@@ -263,7 +276,6 @@ export class PaymentsController {
     res.json({ received: true });
   }
 
-  // Debug endpoint to return recent raw payments for authenticated user (useful while debugging)
   @Get("debug/recent")
   @UseGuards(JwtAuthGuard)
   async debugRecent(@Req() req: Request) {
@@ -273,9 +285,6 @@ export class PaymentsController {
     return rows;
   }
 
-  /* ---------- New: delete single and clear pending endpoints ---------- */
-
-  // Delete a single payment by id (authenticated)
   @Delete(":id")
   @UseGuards(JwtAuthGuard)
   async deletePayment(@Req() req: Request, @Param("id") id: string) {
@@ -292,7 +301,6 @@ export class PaymentsController {
     }
   }
 
-  // Clear all pending payments for authenticated user
   @Delete("clear-pending")
   @UseGuards(JwtAuthGuard)
   async clearPending(@Req() req: Request) {

@@ -1,5 +1,9 @@
-import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, UpdateDateColumn } from 'typeorm';
+import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, UpdateDateColumn, Index } from 'typeorm';
 
+@Index('ux_payments_paypal_order_id', ['paypalOrderId'], { unique: true })
+@Index('ux_payments_paypal_capture_id', ['paypalCaptureId'], { unique: true })
+@Index('ux_payments_client_temp_id', ['clientTempId'], { unique: false })
+@Index('ux_payments_user_plan_minute', ['user_id', 'plan', 'billingPeriod', 'createdAtMinute'], { unique: true })
 @Entity({ name: 'payments' })
 export class Payment {
   @PrimaryGeneratedColumn()
